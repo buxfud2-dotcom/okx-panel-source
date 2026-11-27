@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OKX AI Trading Scanner V4.0 - A-F Strategy Groups
+OKX AI Trading Scanner V5.1.1 - Diagnostics & UI Consistency Fixes
 - Sinyal analizi 1H/4H/1D; grafik zaman dilimi analiz zaman diliminden bagimsizdir.
-- OKX SWAP evreni dinamik kesfedilir; minimum hacim ve spread kosullariyla uygun kontratlar secilir.
-- A-F gruplari bagimsiz kosullarla degerlendirilir; tek kaliteli grup sinyal icin yeterlidir.
+- OKX SWAP evreni dinamik kesfedilir; hacim ve spread esikleri parite evrenini daraltmaz.
+- Grup 0 rejim/yön kapısıdır; 1-5 ve 7 bağımsız motor, Grup 6 confluence katmanıdır.
 - Kapanmis mum tabanli, idempotent islem takibi; 30 saniyelik LAST fiyat tazelik kontrolu.
 - TP1 %50, TP2 %30, TP3 %20; muhafazakar ayni-mum TP/SL cozumlemesi.
 - Bu uygulama sinyal ve sanal takip panelidir; otomatik borsa emri gondermez.
-Calistir:  python okx_ai_trading_scanner_v4.py
+Calistir:  python okx_ai_trading_scanner_v5_1.py
 Gereksinim: Python 3.8+ (harici kutuphane yok; grafik kutuphanesi web arayuzunde CDN ile yuklenir).
 Not: Backtest/cost varsayimlari tahmindir; canli net karlilik veya basari garantisi vermez.
 """
+
+V5_1_BUILD = "2026-11-26-v5.1.1-diagnostics-fix"
 
 import base64
 import bisect
@@ -19,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import socket
 import ssl
 import shutil
@@ -46,48 +49,61 @@ SCAN_INTERVAL_SEC = 30
 PRICE_POLL_SEC = 2.0
 MAX_WORKERS = 16
 CANDLE_LIMIT = 240
+BACKTEST_CANDLES_BY_TF = {"15m": 4200, "1H": 4200, "4H": 2400, "1D": 1200}
+BACKTEST_MAX_PAIRS = None  # None = keşfedilen tüm aktif SWAP sözleşmeleri
+CI_BOOTSTRAP_SAMPLES = 500
+CI_MIN_SAMPLE = 30
+LAST_DISCOVERY_STATS = {"total": 0, "eligible": 0, "excluded": 0, "invalid": 0, "stale": 0,
+                        "instrument_metadata_ok": False, "using_fallback": False, "error": None}
 SOFT_STALE_CRYPTO_SEC = 30.0
-PRICE_FRESHNESS_SEC = 30.0
-MAX_TICKER_AGE_SEC = 30.0
-TOP_N_PAIRS = None
-MIN_VOL_USDT_24H = 1_000_000.0  # düşük likiditeli kontratları elemek için başlangıç eşiği
-MAX_SPREAD_PCT = 0.25          # ticker bid/ask üzerinden azami anlık spread
+PRICE_FRESHNESS_SEC = 120.0
+MAX_TICKER_AGE_SEC = 120.0
 STABLE_BASES = set()
 
-# ------------------- A-F KONSEPT GRUPLARI (HER GRUP KENDI BASINA SINYAL URETIR) -------------------
-# Bir grubun TUM bilesenleri ayni yonde uyusursa sinyal o grubun adiyla gelir; basari orani grup bazinda olculur.
+# ------------------- V5.1 GRUP 0-7 MIMARISI -------------------
+# Grup 0 rejim/yon kapisidir; tek basina sinyal veya islem uretmez.
 GROUP_LABELS = {
-    "A": "Grup A · Likidite Süpürmesi + Yapı Onayı",
-    "B": "Grup B · BOS + Retest + Tepki",
-    "C": "Grup C · Güçlü CHoCH + Arz/Talep",
-    "D": "Grup D · Hacimli İtki + Düşük Hacimli Geri Çekilme",
-    "E": "Grup E · EQH/EQL Süpürme + Geri Alma",
-    "F": "Grup F · İlk Test OB + FVG Çakışması",
+    "1": "Grup 1 · Trend Devamı / EMA + OB Retest",
+    "2": "Grup 2 · Trend Devamı / EMA + FVG Retest",
+    "3": "Grup 3 · Yapısal BOS Breakout",
+    "4": "Grup 4 · Likidite Sweep + Güçlü CHoCH Reversal",
+    "5": "Grup 5 · EQ Sweep + Trend Yönünde Yapı Onayı",
+    "6": "Grup 6 · OB + FVG Confluence Katmanı",
+    "7": "Grup 7 · Momentum / Impulse Pullback",
 }
-GROUP_CODES = ("A", "B", "C", "D", "E", "F")
-GROUP_SHORT = {"A": "Sweep+Onay", "B": "BOS+Retest", "C": "Güçlü CHoCH", "D": "İtki+Geri Çekilme", "E": "EQ Sweep", "F": "İlk OB+FVG"}
+GROUP_CODES = ("1", "2", "3", "4", "5", "6", "7")
+GROUP_SIGNAL_CODES = ("1", "2", "3", "4", "5", "7")  # bağımsız sinyal motorları
+GROUP_LAYER_CODES = ("6",)  # bağımsız performans motoru değildir
+GROUP_SHORT = {
+    "1": "EMA+OB", "2": "EMA+FVG", "3": "BOS Breakout",
+    "4": "Sweep+CHoCH", "5": "EQ Sweep Devam", "6": "OB+FVG Katman",
+    "7": "Momentum Pullback",
+}
 GROUP_DEFS = {
-    "A": ("sweep_confirm", "zone", "cs"),
-    "B": ("bos", "retest", "reaction", "zone", "ema20", "adx", "rvol", "room"),
-    "C": ("choch_strong", "snd_ob", "cs"),
-    "D": ("ce", "fvg_ob", "impulse_pullback", "reaction", "room"),
-    "E": ("eq", "rvol_e", "cs"),
-    "F": ("ob_fvg", "first_test", "reaction", "room"),
+    "1": ("EMA20/50+slope", "Group0 direction", "HTF aligned/neutral", "ADX>=18", "first OB retest", "reaction"),
+    "2": ("EMA20/50+slope", "Group0 direction", "HTF aligned/neutral", "ADX>=18", "BOS retest", "FVG retest", "reaction"),
+    "3": ("BOS close", "RVOL>=1.20", "ADX rising OR ATR expanding", "body>=0.55 ATR", "close strength"),
+    "4": ("liquidity sweep", "EQH/EQL", "strong CHoCH", "RVOL>=1.60", "reaction", "sideways/transition/high volatility"),
+    "5": ("EQ sweep", "sweep reclaim", "BOS/CHoCH", "HTF aligned/neutral", "RVOL>=0.90", "reaction"),
+    "6": ("EMA200 bias", "OB+FVG overlap", "first test", "PD or CE50", "reaction"),
+    "7": ("EMA slope", "RSI directional", "RVOL>=0.90", "3-5 bar impulse", "2-4 bar pullback", "reaction", "ADX>=18"),
 }
-GROUP_TREND_ONLY = ("B", "D", "F")   # devam gruplari: YATAY rejimde kapali, P/D esnetmesi sadece bunlarda
+GROUP_TREND_ONLY = ("1", "2", "3", "5", "7")
+GROUP_REVERSAL_ONLY = ("4",)
+GROUP_LAYER_ONLY = ("6",)  # Grup 6 bagimsiz motor degildir; ana sinyale confluence ekler.
 
 # ------------------- STRATEJI AYARLARI (Az ama Oz · %3-%5 Potansiyel Odakli) -------------------
 ALL_SCAN_TFS = ("1H", "4H", "1D")
 MAIN_CONCEPTS = ("ICT", "FVG", "Order Block", "Supply & Demand")
-MIN_INDEPENDENT_GROUPS = 2  # yalnızca eski/legacy motor için; A-F motoru tek kaliteli gruba izin verir
-MIN_SCORE = 84
-POOR_PERF_MIN_SCORE = 88
+MIN_INDEPENDENT_GROUPS = 2  # yalnızca eski/legacy motor için; 1–7 motoru tek kaliteli gruba izin verir
+MIN_SCORE = 80
+POOR_PERF_MIN_SCORE = 80  # öğrenme modülü düşük performansta eşiği tekrar sıkılaştırmaz
 LEARN_MIN_CLOSED_TRADES = 20
 MAX_SCORE_CAP = 99
-MAX_ACTIVE_SIGNALS = 12
-MAX_SAME_SIDE_ACTIVE = 6
-MAX_NEW_PER_SCAN = 3
-MAX_SIGNALS_PER_DAY = None
+MAX_ACTIVE_SIGNALS = None      # V5.1: açık sinyal adedi için genel kota yok
+MAX_SAME_SIDE_ACTIVE = None    # V5.1: yön bazlı kota yok
+MAX_NEW_PER_SCAN = None        # V5.1: tarama başına sinyal kotası yok
+MAX_SIGNALS_PER_DAY = None     # V5.1: günlük sinyal kotası yok
 COOLDOWN_CANDLES = 0
 EXPIRE_CANDLES_BY_TF = {"15m": 36, "1H": 30, "4H": 16, "1D": 7}
 EXPIRE_CANDLES = 36
@@ -107,11 +123,16 @@ MIN_RVOL = 1.20
 MIN_ROOM_R = 2.40
 MIN_SWING_POTENTIAL_PCT = 2.8
 MAX_STOP_ATR = 2.6
-MIN_STOP_ATR = 1.0
-MAX_CHASE_ATR = 0.40
-MIN_ADX = 21.0
-STOP_BUFFER_ATR = 0.40
-MAX_STOP_PCT = {"1H": 3.5, "4H": 3.5, "1D": 7.0}   # giris fiyatina gore maksimum stop mesafesi (%)
+MIN_STOP_ATR = 1.20
+MAX_CHASE_ATR = 0.55
+MIN_ADX = 21.0               # Legacy ICT referansı; Grup 0-7 için G_MIN_ADX=18 kullanılır
+STOP_BUFFER_ATR = 0.45       # V5.1 yeni Grup 0-7 stop tamponu
+MAX_STOP_PCT = {"15m": 3.0, "1H": 4.5, "4H": 5.5, "1D": 8.0}   # V5.1 grup motoru
+LEGACY_MIN_SCORE = 84
+LEGACY_MIN_STOP_ATR = 1.0
+LEGACY_STOP_BUFFER_ATR = 0.40
+LEGACY_MAX_CHASE_ATR = 0.40
+LEGACY_MAX_STOP_PCT = {"1H": 3.5, "4H": 3.5, "1D": 7.0}
 
 # ------------------- V2.6: KONTROLLU GEVSETME AYARLARI -------------------
 # "v3" = yeni mantik, "legacy" = V2.5 davranisi (karsilastirma / geri donus icin)
@@ -126,27 +147,35 @@ PD_STRONG_SHORT_MIN = 0.28     # guclu BOS + trend devaminda short icin 60 mumlu
 ZONE_MAX_PRIOR_VISITS = 1      # bolge bu retest'ten once en fazla 1 kez test edilmis olabilir (fazlasi = tuketilmis)
 SHADOW_MIN_SCORE_GAP = 6       # skor esigin en fazla bu kadar altindaysa sanal takibe alinir
 SHADOW_LIMIT = 1500
-COOLDOWN_CANDLES_V3 = {"15m": 0, "1H": 0, "4H": 0, "1D": 0}
+COOLDOWN_CANDLES_V3 = {"15m": 2, "1H": 2, "4H": 1, "1D": 1}
 
-# ------------------- V3.0: GRUP MOTORU ESIKLERI (eski sabitlere dokunulmaz) -------------------
-G_MIN_ADX = 20.0               # eski 21
-G_MIN_RVOL = 1.10              # eski 1.20 (sadece RVol iceren gruplarda)
-G_SLOPE_MIN = 0.05             # EMA20'nin son 3 mumdaki egimi, ATR cinsinden
-G_ATR_EXP = 1.15               # ATR genisligi: son 2 mumdan biri >= 1.15 x ATR
+# ------------------- V5.1: GRUP MOTORU ESIKLERI -------------------
+G_MIN_ADX = 18.0               # V5.1: 18+ trend-adayı; 18-20 geçiş bölgesi de puanlanır
+G_MIN_RVOL = 0.90              # V5.1: hacim tek başına sert kapı değildir
+G_SLOPE_MIN = 0.03             # EMA20 son 3 mum eğimi (ATR cinsinden)
+G_ATR_EXP = 1.05               # ATR genişleme teyidi için daha dengeli eşik
 G_RSI_LONG = (40.0, 68.0)      # eski (42, 66)
 G_RSI_SHORT = (32.0, 60.0)     # eski (34, 58)
 G_RSI_EXTREME_LONG = 74.0      # RSI iceren/icermeyen tum gruplarda asiri uc siniri
 G_RSI_EXTREME_SHORT = 26.0
-G_MIN_ROOM_R = 2.05             # "Alan" bileseni olan gruplar (B, D, F) icin; eski 2.4
-G_MIN_POT_PCT = 2.35            # eski 2.8
-G_BASE_ROOM_R = 1.5            # Alan bileseni olmayan gruplar (A, C, E) icin taban (TP1 1.2R'ye ulasabilmeli)
+G_MIN_ROOM_R = 2.05             # Yapısal alanı kritik Grup 2/3 için korunur
+G_MIN_POT_PCT = 2.35            # Grup 2/3 için minimum potansiyel (%)
+G_BASE_ROOM_R = 1.50           # Diğer bağımsız gruplar için minimum ROOM
+G_BASE_POT_PCT = 1.80          # Diğer gruplar için minimum potansiyel (%)
 G_D_MIN_RVOL = 1.0             # V3 uyumluluğu; yeni D grubunda kullanılmaz
-G_E_MIN_RVOL = 1.20            # E: RVol yalnızca EQH/EQL süpürme mumundan hesaplanır
-G_CHOCH_ATR_MIN = 1.00         # C: ilk sürüm; 0.75 ATR alternatifi ayrıca karşılaştırılabilir
+G_E_MIN_RVOL = 0.90            # Grup 5: EQ sweep hacmi için daha esnek başlangıç
+G_CHOCH_ATR_MIN = 0.75         # Güçlü CHoCH için gövde eşiği (ATR)
 G_A_CONFIRM_WINDOW = 4         # A: süpürmeden sonra en fazla 4 kapanmış mum içinde yapı onayı
 G_BOS_LOOKBACK = 5             # B: yapi kirilimi son N mum icinde olmali
-G_MAX_EMA20_DIST_ATR = 1.2     # B: fiyat EMA20'ye en fazla bu kadar ATR uzakta (kovalama engeli)
-G_CONFIRM_CLOSE_THR = 0.50     # onay mumu: kapanis mumun ilgili yarisinda
+G_MAX_EMA20_DIST_ATR = 1.2     # EMA20'ye aşırı uzak girişleri önler
+G_CONFIRM_CLOSE_THR = 0.50     # onay mumu kapanış gücü
+G3_MIN_RVOL = 1.20
+G3_MIN_BODY_ATR = 0.55
+G3_MIN_CLOSE_STRENGTH = 0.60
+G4_MIN_RVOL = 1.60
+G5_MIN_RVOL = 0.90
+G2_BOS_MIN_RVOL = 1.10
+G2_ENTRY_MIN_RVOL = 0.90
 BACKTEST_SLIPPAGE_PCT = 0.03   # tek yönlü stres/fill varsayımı; gerçek borsa dolumu garantisi değildir
 
 
@@ -206,13 +235,18 @@ def swap_to_pair(inst_id):
 
 
 def pair_to_swap(pair_str):
-    """BTC/USDT veya BTC-USDT -> BTC-USDT-SWAP"""
-    clean = (pair_str or "").strip().upper().replace("/", "-")
+    """BTC/USDT, BTC/USD veya BTC-USDC -> doğru OKX SWAP enstrüman kimliği."""
+    clean = (pair_str or "").strip().upper().replace(" ", "")
     if clean.endswith("-SWAP"):
         return clean
-    if not clean.endswith("-USDT"):
-        clean = f"{clean}-USDT"
-    return f"{clean}-SWAP"
+    clean = clean.replace("/", "-")
+    parts = [p for p in clean.split("-") if p]
+    if len(parts) >= 2 and parts[-1] in {"USDT", "USDC", "USD"}:
+        return f"{'-'.join(parts)}-SWAP"
+    if len(parts) == 1:
+        return f"{parts[0]}-USDT-SWAP"
+    # Bilinmeyen quote kodunu koru; sembolü sessizce USDT'ye çevirmeyiz.
+    return f"{'-'.join(parts)}-SWAP"
 
 
 def check_news_window():
@@ -479,12 +513,12 @@ class Throttle:
             time.sleep(d)
 
 
-CANDLE_THROTTLE = Throttle(16)
+CANDLE_THROTTLE = Throttle(16)  # canlı mum/son mum istekleri
+HISTORY_THROTTLE = Throttle(8)  # geçmiş mum API'sinde daha temkinli hız
+BTC_HISTORY_CACHE = {}
+BTC_HISTORY_LOCK = threading.Lock()
 CANDLE_CACHE = {}
 CACHE_LOCK = threading.Lock()
-MARKET_INFO_CACHE = {}
-MARKET_INFO_LOCK = threading.Lock()
-MARKET_INFO_TTL_SEC = 60.0
 
 
 def fetch_json(url, retries=2, timeout=8):
@@ -511,157 +545,68 @@ def fetch_json(url, retries=2, timeout=8):
     raise last_err
 
 
-def _swap_vol_usdt(row, px):
-    """OKX USDT-margined SWAP ticker'ındaki base-currency hacmini USDT notional'a çevirir."""
-    try:
-        vol_ccy = float(row.get("volCcy24h") or 0.0)
-    except (TypeError, ValueError):
-        vol_ccy = 0.0
-    if vol_ccy > 0 and px > 0:
-        return vol_ccy * px
-    # vol24h sözleşme adedidir; ctVal bilinmeden USDT notional'a güvenle çevrilemez.
-    return 0.0
-
-
-def _market_cost_info_cached(inst_id, fallback_price=0.0, side="LONG", tf="4H"):
-    """Sinyal adayı için OKX public orderbook + funding verisini önbellekli alır.
-
-    Orderbook notional hesabı ancak sözleşme çarpanı/currency güvenle tanımlanabiliyorsa verilir.
-    Funding maliyeti, elde tutma süresinin tahmini boyunca yalnızca ödeyen taraf için eklenir.
-    """
-    now = time.time()
-    cache_key = (inst_id, side, tf)
-    with MARKET_INFO_LOCK:
-        cached = MARKET_INFO_CACHE.get(cache_key)
-        if cached and now - cached.get("cached_at", 0.0) <= MARKET_INFO_TTL_SEC:
-            return dict(cached)
-
-    result = {
-        "spread_pct": None, "book_depth_usdt": None, "book_depth_side": None,
-        "funding_rate": None, "funding_interval_hours": 8.0,
-        "funding_cost_pct": None, "market_data_source": "ESTIMATE",
-        "book_source": "UNAVAILABLE", "funding_source": "ESTIMATE",
-    }
-    base_ccy = inst_id.split("-")[0] if "-" in inst_id else ""
-
-    # Funding rate; instrument bazında ve cache ile çağrılır.
-    try:
-        fr = fetch_json(f"https://www.okx.com/api/v5/public/funding-rate?instId={inst_id}", retries=1, timeout=5)
-        row = (fr.get("data") or [None])[0]
-        if str(fr.get("code", "0")) == "0" and row:
-            rate = float(row.get("fundingRate"))
-            interval_h = 8.0
-            try:
-                t0 = int(row.get("fundingTime") or 0)
-                t1 = int(row.get("nextFundingTime") or 0)
-                if t0 > 0 and t1 > t0:
-                    interval_h = max(1.0, min(24.0, (t1 - t0) / 3600000.0))
-            except (TypeError, ValueError):
-                pass
-            hold_h = expire_candles_for_tf(tf) * TF_SEC.get(tf, 14400) / 3600.0 * 0.5
-            payer_rate = max(0.0, rate if side == "LONG" else -rate)
-            result.update({
-                "funding_rate": rate,
-                "funding_interval_hours": interval_h,
-                "funding_cost_pct": payer_rate * 100.0 * hold_h / interval_h,
-                "funding_source": "OKX_PUBLIC_FUNDING_RATE",
-            })
-    except Exception as e:
-        log.debug("Funding verisi alınamadı (%s): %s", inst_id, e)
-
-    # Orderbook + sözleşme değeri: doğru kontrat notional'ı hesaplanamazsa depth alanı boş kalır.
-    try:
-        book = fetch_json(f"https://www.okx.com/api/v5/market/books?instId={inst_id}&sz=5", retries=1, timeout=5)
-        book_row = (book.get("data") or [None])[0]
-        if str(book.get("code", "0")) == "0" and book_row:
-            bids = book_row.get("bids") or []
-            asks = book_row.get("asks") or []
-            bid_px = float(bids[0][0]) if bids else 0.0
-            ask_px = float(asks[0][0]) if asks else 0.0
-            if bid_px > 0 and ask_px >= bid_px:
-                mid = (bid_px + ask_px) / 2.0
-                result["spread_pct"] = (ask_px - bid_px) / max(mid, 1e-12) * 100.0
-            inst = fetch_json(f"https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}", retries=1, timeout=5)
-            meta = (inst.get("data") or [None])[0]
-            if str(inst.get("code", "0")) == "0" and meta:
-                ct_val = float(meta.get("ctVal") or 0.0)
-                ct_ccy = str(meta.get("ctValCcy") or "").upper()
-                quote_ccy = inst_id.split("-")[1].upper() if len(inst_id.split("-")) > 2 else "USDT"
-                side_levels = asks if side == "LONG" else bids
-                depth = 0.0
-                valid = ct_val > 0 and bool(ct_ccy)
-                for level in side_levels[:5]:
-                    px_l, sz_l = float(level[0]), float(level[1])
-                    if px_l <= 0 or sz_l <= 0:
-                        continue
-                    if ct_ccy == quote_ccy:
-                        depth += sz_l * ct_val
-                    elif ct_ccy == base_ccy.upper():
-                        depth += sz_l * ct_val * px_l
-                    else:
-                        valid = False
-                        break
-                if valid:
-                    result["book_depth_usdt"] = depth
-                    result["book_depth_side"] = "ASK" if side == "LONG" else "BID"
-                    result["book_source"] = "OKX_BOOK_TOP5_CONTRACT_CONVERTED"
-    except Exception as e:
-        log.debug("Orderbook derinliği alınamadı (%s): %s", inst_id, e)
-
-    result["market_data_source"] = "OKX_PUBLIC" if result["funding_source"] != "ESTIMATE" or result["book_source"] != "UNAVAILABLE" else "ESTIMATE"
-    result["cached_at"] = now
-    with MARKET_INFO_LOCK:
-        MARKET_INFO_CACHE[cache_key] = dict(result)
-    return result
-
-
 def discover_live_swap_pairs():
-    """OKX SWAP (kaldiracli) tarafinda canli LAST fiyati ve guncel ts'si bulunan tum SWAP kontratlarini alir."""
+    """OKX'teki tüm aktif SWAP sözleşmelerini hacim/spread sıralama filtresi olmadan keşfeder."""
+    global LAST_DISCOVERY_STATS
+    stats = {"total": 0, "eligible": 0, "excluded": 0, "invalid": 0,
+             "stale": 0, "instrument_metadata_ok": False,
+             "using_fallback": False, "error": None}
+    active_ids = None
     try:
-        r = fetch_json("https://www.okx.com/api/v5/market/tickers?instType=SWAP", retries=2, timeout=12)
-        if str(r.get("code", "0")) == "0":
-            now_m = now_ms()
-            max_age_ms = MAX_TICKER_AGE_SEC * 1000.0
-            ranked = []
-            for row in (r.get("data") or []):
-                inst = (row.get("instId") or "").strip()
-                if not inst.endswith("-SWAP") or row.get("last") in (None, ""):
-                    continue
-                try:
-                    px = float(row["last"])
-                    vol_usdt = _swap_vol_usdt(row, px)
-                    ts_v = int(row.get("ts") or 0)
-                    o24 = float(row.get("open24h") or 0.0)
-                    bid_px = float(row.get("bidPx") or 0.0)
-                    ask_px = float(row.get("askPx") or 0.0)
-                    if px <= 0 or ts_v <= 0 or (now_m - ts_v) > max_age_ms or ts_v > now_m + 5000:
-                        continue
-                    if MIN_VOL_USDT_24H > 0 and vol_usdt < MIN_VOL_USDT_24H:
-                        continue
-                    # Bid/ask yoksa spread doğrulanamaz; bu kontratı sinyal evrenine alma.
-                    if bid_px <= 0 or ask_px <= 0 or ask_px < bid_px:
-                        continue
-                    mid_px = (ask_px + bid_px) / 2.0
-                    spread_pct = ((ask_px - bid_px) / max(mid_px, 1e-12)) * 100.0
-                    if spread_pct > MAX_SPREAD_PCT:
-                        continue
-                    ranked.append((vol_usdt, inst, px, ts_v, o24, spread_pct, bid_px, ask_px))
-                except Exception:
-                    continue
-            ranked.sort(key=lambda x: -x[0])
-            if TOP_N_PAIRS is not None:
-                ranked = ranked[:TOP_N_PAIRS]
-            pairs = [x[1] for x in ranked]
-            snap = {x[1]: {"price": x[2], "ts_ms": x[3], "open24h": x[4],
-                           "vol_24h_usdt": x[0], "spread_pct": round(x[5], 4),
-                           "bid_px": x[6], "ask_px": x[7]} for x in ranked}
-            # API basarili olsa bile hicbir kontrat kalite filtresini gecmediyse fallback
-            # listesini sinyal evreni gibi kullanma. BTC fiyatini baska coinden kopyalama.
-            return pairs, snap
+        inst_resp = fetch_json("https://www.okx.com/api/v5/public/instruments?instType=SWAP", retries=2, timeout=12)
+        if str(inst_resp.get("code", "0")) == "0":
+            active_ids = {str(row.get("instId")) for row in (inst_resp.get("data") or [])
+                          if str(row.get("state", "")).lower() == "live" and str(row.get("instId", "")).endswith("-SWAP")}
+            stats["instrument_metadata_ok"] = True
     except Exception as e:
-        log.warning("OKX SWAP parite listesi alinamadi, yedek liste kullanilacak: %s", e)
-    return list(FALLBACK_CRYPTO_PAIRS), {}
+        stats["error"] = f"Sözleşme metadata alınamadı: {e}"
+        log.warning("OKX SWAP aktif sözleşme metadata alınamadı: %s", e)
 
+    try:
+        tick = fetch_json("https://www.okx.com/api/v5/market/tickers?instType=SWAP", retries=2, timeout=12)
+        if str(tick.get("code", "0")) != "0":
+            raise RuntimeError(tick.get("msg") or "Ticker API başarısız")
+        now_m = now_ms()
+        rows = tick.get("data") or []
+        stats["total"] = len(rows)
+        pairs, snap = [], {}
+        for row in rows:
+            inst = str(row.get("instId") or "").strip()
+            if not inst.endswith("-SWAP"):
+                stats["invalid"] += 1
+                continue
+            if active_ids is not None and inst not in active_ids:
+                stats["excluded"] += 1
+                continue
+            try:
+                px = float(row.get("last") or 0.0)
+                ts_v = int(row.get("ts") or 0)
+                o24 = float(row.get("open24h") or 0.0)
+            except (TypeError, ValueError):
+                stats["invalid"] += 1
+                continue
+            if px <= 0 or ts_v <= 0 or ts_v > now_m + 5000:
+                stats["invalid"] += 1
+                continue
+            if now_m - ts_v > MAX_TICKER_AGE_SEC * 1000.0:
+                stats["stale"] += 1
+                continue
+            # Hacim, spread, bid/ask ve kontrat büyüklüğü sinyal evreni filtresi değildir.
+            pairs.append(inst)
+            snap[inst] = {"price": px, "ts_ms": ts_v, "open24h": o24}
+        pairs = sorted(set(pairs))
+        stats["eligible"] = len(pairs)
+        stats["excluded"] += max(0, stats["total"] - stats["eligible"] - stats["invalid"] - stats["stale"] - stats["excluded"])
+        LAST_DISCOVERY_STATS = dict(stats)
+        return pairs, snap
+    except Exception as e:
+        stats["error"] = (stats.get("error") + " | " if stats.get("error") else "") + str(e)
+        stats["using_fallback"] = True
+        LAST_DISCOVERY_STATS = dict(stats)
+        log.warning("OKX SWAP listesi alınamadı; sınırlı yedek liste geçici olarak kullanılıyor: %s", e)
+        # Ağ/API hatasında panel tamamen boş kalmasın; bu listenin tam evren olmadığı UI'de işaretlenir.
+        fallback = list(FALLBACK_CRYPTO_PAIRS)
+        return fallback, {}
 
 def _parse_candle_rows(rows):
     out = []
@@ -713,8 +658,8 @@ def get_okx_history(inst_id, tf, total=900):
     out = []
     after = None
     while len(out) < total:
-        CANDLE_THROTTLE.wait()
-        url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst_id}&bar={tf}&limit=100"
+        HISTORY_THROTTLE.wait()
+        url = f"https://www.okx.com/api/v5/market/history-candles?instId={inst_id}&bar={tf}&limit=300"
         if after:
             url += f"&after={after}"
         raw = fetch_json(url)
@@ -725,7 +670,7 @@ def get_okx_history(inst_id, tf, total=900):
             break
         out.extend(_parse_candle_rows(rows))
         after = rows[-1][0]
-        if len(rows) < 100:
+        if len(rows) < 300:
             break
     uniq = {c["ts"]: c for c in out}
     res = [uniq[k] for k in sorted(uniq)]
@@ -1122,8 +1067,11 @@ def _sweep_reclaim_confirm(candles, atr, is_long, max_confirm=G_A_CONFIRM_WINDOW
     return None
 
 
-def _equal_sweep_event(candles, atr, is_long):
-    """E: EQH/EQL yalnızca süpürülüp seviye içine geri kapanır; breakout seçeneği yoktur."""
+def _equal_sweep_event(candles, atr, is_long, min_rvol=None):
+    """EQH/EQL yalnızca süpürülüp seviye içine geri kapanır; breakout seçeneği yoktur.
+
+    Eski motorun varsayılan eşiği korunur; V5 Grup 5 kendi 1.0 RVOL eşiğini açıkça geçirir.
+    """
     n = len(candles)
     if n < 40:
         return None
@@ -1142,13 +1090,14 @@ def _equal_sweep_event(candles, atr, is_long):
     if not level_pair:
         return None
     level, formed_idx = level_pair
+    required_rvol = G_E_MIN_RVOL if min_rvol is None else float(min_rvol)
     for i in range(n - 1, max(formed_idx + 1, n - 6) - 1, -1):
         c = candles[i]
         swept = (c["low"] < level - 0.05 * atr and c["close"] > level) if is_long else (
             c["high"] > level + 0.05 * atr and c["close"] < level)
         if swept:
             rv = _candle_rvol_at(candles, i, 20)
-            if rv is not None and rv >= G_E_MIN_RVOL:
+            if rv is not None and rv >= required_rvol:
                 return {"index": i, "level": level, "rvol": rv,
                         "ts": c["ts"], "label": "EQL süpürme" if is_long else "EQH süpürme"}
     return None
@@ -1218,33 +1167,43 @@ def _bos_retest_reaction(candles, atr, is_long, bos_event):
 
 
 def _impulse_pullback_reaction(candles, is_long, atr):
-    """D: 5 mumluk yönlü itki + 3 mumluk daha düşük hacimli geri çekilme + son mum tepki."""
-    if len(candles) < 12:
+    """V5.1: 3-5 mumluk itki + 2-4 mumluk geri çekilme + kapanmış tepki mumu."""
+    if len(candles) < 8 or atr <= 0:
         return None
     reaction_idx = len(candles) - 1
     reaction = candles[reaction_idx]
     if not _reaction_candle(candles, reaction_idx, is_long):
         return None
-    impulse = candles[-9:-4]
-    pullback = candles[-4:-1]
-    if len(impulse) != 5 or len(pullback) != 3:
-        return None
-    iv = sum(max(0.0, float(c.get("vol", 0.0))) for c in impulse) / len(impulse)
-    pv = sum(max(0.0, float(c.get("vol", 0.0))) for c in pullback) / len(pullback)
-    if iv <= 0 or pv >= iv:
-        return None
-    impulse_move = impulse[-1]["close"] - impulse[0]["open"] if is_long else impulse[0]["open"] - impulse[-1]["close"]
-    pullback_move = pullback[0]["open"] - pullback[-1]["close"] if is_long else pullback[-1]["close"] - pullback[0]["open"]
-    if impulse_move < 1.2 * atr or pullback_move <= 0 or pullback_move > 0.70 * impulse_move:
-        return None
-    if is_long and not (reaction["close"] > reaction["open"] and reaction["close"] >= pullback[-1]["high"] * 0.995):
-        return None
-    if (not is_long) and not (reaction["close"] < reaction["open"] and reaction["close"] <= pullback[-1]["low"] * 1.005):
-        return None
-    return {"impulse_avg_volume": iv, "pullback_avg_volume": pv,
-            "impulse_start_ts": impulse[0]["ts"], "pullback_start_ts": pullback[0]["ts"],
-            "reaction_ts": reaction["ts"]}
-
+    best = None
+    for impulse_len in (5, 4, 3):
+        for pull_len in (4, 3, 2):
+            start = reaction_idx - pull_len - impulse_len
+            if start < 0:
+                continue
+            impulse = candles[start:start + impulse_len]
+            pullback = candles[start + impulse_len:reaction_idx]
+            if len(impulse) != impulse_len or len(pullback) != pull_len:
+                continue
+            iv = sum(max(0.0, float(c.get("vol", 0.0) or 0.0)) for c in impulse) / impulse_len
+            pv = sum(max(0.0, float(c.get("vol", 0.0) or 0.0)) for c in pullback) / pull_len
+            if iv <= 0 or pv > iv * 1.05:
+                continue
+            impulse_move = (float(impulse[-1]["close"]) - float(impulse[0]["open"])) if is_long else (float(impulse[0]["open"]) - float(impulse[-1]["close"]))
+            pullback_move = (float(pullback[0]["open"]) - float(pullback[-1]["close"])) if is_long else (float(pullback[-1]["close"]) - float(pullback[0]["open"]))
+            if impulse_move < 1.0 * atr or pullback_move <= 0 or pullback_move > 0.85 * impulse_move:
+                continue
+            if is_long and not (reaction["close"] > reaction["open"] and reaction["close"] >= pullback[-1]["high"] * 0.995):
+                continue
+            if (not is_long) and not (reaction["close"] < reaction["open"] and reaction["close"] <= pullback[-1]["low"] * 1.005):
+                continue
+            score = impulse_move / atr - 0.25 * (pullback_move / max(impulse_move, 1e-12))
+            candidate = (score, {"impulse_avg_volume": iv, "pullback_avg_volume": pv,
+                                 "impulse_start_ts": impulse[0]["ts"], "pullback_start_ts": pullback[0]["ts"],
+                                 "reaction_ts": reaction["ts"], "impulse_len": impulse_len,
+                                 "pullback_len": pull_len})
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    return best[1] if best else None
 
 def _ob_fvg_first_test(candles, active_zones, is_long):
     """F: OB/FVG kesişiminde tek ilk ziyaret epizodu ve en geç 3 mum içinde tepki."""
@@ -1462,6 +1421,9 @@ def _evaluate_signal_classic(meta, tf, closed_map, live_price, btc_bias, learn, 
     """Tum pariteler BTC'den bagimsiz analiz edilir. btc_bias parametresi geriye donuk uyumluluk icin tutulur."""
     mode = mode or STRATEGY_MODE
     v3 = mode != "legacy"
+    # Classic/legacy motorunda Grup 0-7'nin missing_by_group haritasi bulunmaz.
+    # Engelleme kaydinda bu alanin kullanilmasi legacy A/B testinde NameError olusturmasin.
+    missing_by_group = {}
     prim = closed_map.get(tf) or []
     if len(prim) < 80 or not live_price or live_price <= 0:
         return None
@@ -1474,7 +1436,8 @@ def _evaluate_signal_classic(meta, tf, closed_map, live_price, btc_bias, learn, 
     if regime == "YÜKSEK VOLATİLİTE":
         _note(diag, tf, None, "REJİM_VOLATİL", lts)
         return None
-    if abs(live_price - last["close"]) > MAX_CHASE_ATR * atr:
+    classic_chase = LEGACY_MAX_CHASE_ATR if mode == "legacy" else MAX_CHASE_ATR
+    if abs(live_price - last["close"]) > classic_chase * atr:
         _note(diag, tf, None, "KOVALAMA", lts)
         return None
 
@@ -1508,7 +1471,10 @@ def _evaluate_signal_classic(meta, tf, closed_map, live_price, btc_bias, learn, 
 
     news_risk, news_label = news if news is not None else check_news_window()
     concept_mults = (learn or {}).get("concept_mults", {}) or {}
-    min_score = max(MIN_SCORE, int((learn or {}).get("min_score", MIN_SCORE)))
+    if mode == "legacy":
+        min_score = max(LEGACY_MIN_SCORE, int((learn or {}).get("min_score", LEGACY_MIN_SCORE)))
+    else:
+        min_score = max(MIN_SCORE, int((learn or {}).get("min_score", MIN_SCORE)))
 
     rng_hi = max(c["high"] for c in prim[-60:])
     rng_lo = min(c["low"] for c in prim[-60:])
@@ -1662,10 +1628,14 @@ def _evaluate_signal_classic(meta, tf, closed_map, live_price, btc_bias, learn, 
 
         entry = live_price
         if is_long:
-            sl_raw = min(zlo, min(c["low"] for c in prim[-5:])) - STOP_BUFFER_ATR * atr
+            stop_buffer_legacy = LEGACY_STOP_BUFFER_ATR if mode == "legacy" else STOP_BUFFER_ATR
+            min_stop_legacy = LEGACY_MIN_STOP_ATR if mode == "legacy" else MIN_STOP_ATR
+            sl_raw = min(zlo, min(c["low"] for c in prim[-5:])) - stop_buffer_legacy * atr
             risk = entry - sl_raw
         else:
-            sl_raw = max(zhi, max(c["high"] for c in prim[-5:])) + STOP_BUFFER_ATR * atr
+            stop_buffer_legacy = LEGACY_STOP_BUFFER_ATR if mode == "legacy" else STOP_BUFFER_ATR
+            min_stop_legacy = LEGACY_MIN_STOP_ATR if mode == "legacy" else MIN_STOP_ATR
+            sl_raw = max(zhi, max(c["high"] for c in prim[-5:])) + stop_buffer_legacy * atr
             risk = sl_raw - entry
         if risk <= 0:
             _note(diag, tf, side, "STOP_GEÇERSİZ", lts)
@@ -1675,7 +1645,10 @@ def _evaluate_signal_classic(meta, tf, closed_map, live_price, btc_bias, learn, 
             _note(diag, tf, side, "STOP_GENİŞ", lts, blocks=["STOP_GENİŞ"] + blocks,
                   cand=sh, stage="setup")
             continue
-        risk = max(risk, MIN_STOP_ATR * atr)
+        risk = max(risk, min_stop_legacy * atr)
+        if risk > MAX_STOP_ATR * atr:
+            _note(diag, tf, side, "STOP_GENİŞ", lts, blocks=["STOP_GENİŞ"], stage="hard")
+            continue
         sl = entry - risk if is_long else entry + risk
         if sl <= 0:
             continue
@@ -1836,7 +1809,7 @@ def _evaluate_signal_classic(meta, tf, closed_map, live_price, btc_bias, learn, 
 
 
 # =====================================================================
-#  V3.0 GRUP MOTORU: yeni indikator / konsept yardimcilari
+#  V5.1 GRUP MOTORU: yeni indikatör / konsept yardımcıları
 # =====================================================================
 def _ema_slope_atr(vals, period, atr, back=3):
     """EMA'nin son `back` mumdaki degisimi (ATR cinsinden)."""
@@ -1991,440 +1964,600 @@ def _group_hist_bonus(learn, codes):
 
 
 # =====================================================================
-#  V3.0 GRUP MOTORU: sinyal uretimi (A-F)
+#  V5.1 GRUP MOTORU: sinyal üretimi (Group 0 + 1-7)
 # =====================================================================
-def _evaluate_signal_groups(meta, tf, closed_map, live_price, btc_bias, learn, news=None, mode=None, diag=None):
-    """Her grup kendi bilesenleri ayni yonde uyusursa sinyal uretir. Sinyal, uyusan grup(lar)in adini tasir."""
-    mode = mode or "groups"
-    prim = closed_map.get(tf) or []
-    if len(prim) < 80 or not live_price or live_price <= 0:
+def _group0_bias(candles):
+    """Group 0 higher-timeframe direction: EMA200 location plus DI confirmation."""
+    if len(candles) < 205:
+        return "NEUTRAL"
+    closes = [float(c["close"]) for c in candles]
+    ema200 = calc_ema(closes, 200)
+    adx_res = calc_adx(candles, 14)
+    if ema200 is None or adx_res is None:
+        return "NEUTRAL"
+    _adx, pdi, mdi = adx_res
+    px = closes[-1]
+    if px > ema200 and pdi > mdi:
+        return "BULL"
+    if px < ema200 and mdi > pdi:
+        return "BEAR"
+    return "NEUTRAL"
+
+
+def _atr_expansion_ratio(candles, period=14, baseline=40):
+    """ATR14 / onceki ATR14 degerlerinin ortalamasi; yalnizca mevcut ve eski mumlari kullanir."""
+    if len(candles) < period + baseline + 2:
         return None
+    trs = []
+    for i in range(1, len(candles)):
+        h, lo, pc = float(candles[i]["high"]), float(candles[i]["low"]), float(candles[i-1]["close"])
+        trs.append(max(h-lo, abs(h-pc), abs(lo-pc)))
+    if len(trs) < period + baseline:
+        return None
+    cur = sum(trs[:period]) / float(period)
+    vals = [cur]
+    for tr in trs[period:]:
+        cur = (cur * (period - 1) + tr) / float(period)
+        vals.append(cur)
+    ref = vals[-baseline-1:-1]
+    avg = sum(ref) / len(ref) if ref else 0.0
+    return vals[-1] / avg if avg > 0 else None
+
+
+def _equal_liquidity_ahead(candles, atr, is_long, price, max_distance_atr=2.0):
+    """Breakout yonunde yakinda tuketilmemis EQH/EQL havuzu var mi?"""
+    seg = candles[-100:]
+    highs, lows = find_swings(seg, 2, 2)
+    levels = highs if is_long else lows
+    tol = max(0.05 * atr, 1e-12)
+    for a in range(len(levels) - 1, 0, -1):
+        for b in range(a - 1, max(-1, a - 7), -1):
+            if abs(levels[a][1] - levels[b][1]) > 0.25 * atr:
+                continue
+            level = (levels[a][1] + levels[b][1]) / 2.0
+            gap = level - price if is_long else price - level
+            if tol < gap <= max_distance_atr * atr:
+                return True
+    return False
+
+
+def _bos_volume_sequence(candles, bos_idx, atr):
+    """V5.1: BOS hacmi ve retest hacmi kalite teyididir; küçük toleranslı."""
+    last_idx = len(candles) - 1
+    if bos_idx is None or bos_idx >= last_idx - 1:
+        return False, None, None
+    bos_rvol = _candle_rvol_at(candles, bos_idx, 20)
+    entry_rvol = _candle_rvol_at(candles, last_idx, 20)
+    pullback = candles[bos_idx + 1:last_idx]
+    if not pullback or bos_rvol is None or entry_rvol is None:
+        return False, bos_rvol, entry_rvol
+    bos_vol = max(float(candles[bos_idx].get("vol", 0.0) or 0.0), 1e-12)
+    pull_avg = sum(float(c.get("vol", 0.0) or 0.0) for c in pullback) / len(pullback)
+    ok = (bos_rvol >= G2_BOS_MIN_RVOL and pull_avg <= bos_vol * 1.10
+          and entry_rvol >= G2_ENTRY_MIN_RVOL)
+    return bool(ok), bos_rvol, entry_rvol
+
+def _evaluate_signal_groups(meta, tf, closed_map, live_price, btc_bias, learn, news=None, mode=None, diag=None):
+    """V5.1: Grup 0 rejim/yön kapısı; 1-5/7 gevşetilmiş ama yapısal motorlar; 6 confluence."""
+    params = (learn or {}).get("_param_overrides", {}) or {}
+    prim = closed_map.get(tf) or []
+    if len(prim) < 205 or not live_price or live_price <= 0:
+        _note(diag, tf, None, "ANA_TF_VERISI_EKSIK", int((prim or [{}])[-1].get("ts", 0)))
+        return None
+
     atr = calc_atr(prim, 14)
     if atr <= 0:
+        _note(diag, tf, None, "ATR_VERISI_EKSIK", int(prim[-1].get("ts", 0)))
         return None
     last = prim[-1]
-    lts = last["ts"]
-    regime = detect_regime(prim, atr, live_price)
-    if regime == "YÜKSEK VOLATİLİTE":
-        _note(diag, tf, None, "REJİM_VOLATİL", lts)
-        return None
-    if abs(live_price - last["close"]) > MAX_CHASE_ATR * atr:
-        _note(diag, tf, None, "KOVALAMA", lts)
-        return None
-
+    lts = int(last.get("ts", 0))
+    closes = [float(c["close"]) for c in prim]
+    e20, e50, e200 = calc_ema(closes, 20), calc_ema(closes, 50), calc_ema(closes, 200)
     adx_res = calc_adx(prim, 14, with_prev=True)
-    if adx_res is None:
+    if None in (e20, e50, e200) or adx_res is None:
+        _note(diag, tf, None, "INDIKATOR_VERISI_EKSIK", lts)
         return None
     adx, pdi, mdi, adx_prev = adx_res
+    slope20 = _ema_slope_atr(closes, 20, atr, 3)
+    atr_ratio = _atr_expansion_ratio(prim, 14, 40)
+    if atr_ratio is None:
+        _note(diag, tf, None, "ATR_ORANI_VERISI_EKSIK", lts)
+        return None
 
-    ctx_tfs = CONTEXT_TFS[tf]
-    for t in ctx_tfs:
-        if len(closed_map.get(t) or []) < 60:
-            return None
-    biases = {t: tf_bias(closed_map[t]) for t in ctx_tfs}
-    prim_bias = tf_bias(prim)
+    # ---------------- GRUP 0: REJIM + YON KAPISI ----------------
+    high_vol = atr_ratio >= float(params.get("high_vol_ratio", 1.45))
+    dead_vol = atr_ratio < float(params.get("dead_vol_ratio", 0.65))
+    trend_regime = adx >= 20.0
+    sideways_regime = adx < 18.0
+    transition_regime = 18.0 <= adx < 20.0
+    if high_vol and trend_regime:
+        regime = "TREND + YÜKSEK VOLATİLİTE"
+    elif high_vol:
+        regime = "YÜKSEK VOLATİLİTE"
+    elif trend_regime:
+        regime = "TREND"
+    elif sideways_regime:
+        regime = "YATAY"
+    else:
+        regime = "GEÇİŞ"
+
+    if live_price > e200 and pdi > mdi:
+        gate_direction = "LONG"
+    elif live_price < e200 and mdi > pdi:
+        gate_direction = "SHORT"
+    else:
+        gate_direction = None
+
+    if dead_vol:
+        _note(diag, tf, None, "GRUP0_DUSUK_VOL", lts,
+              extra={"atr_ratio": round(atr_ratio, 3), "adx": round(adx, 1), "threshold": 0.65})
+        return None
+
+    ctx_tfs = CONTEXT_TFS.get(tf, ())
+    ctx_biases = {}
+    htf_short_tfs = []
+    for ctx_tf in ctx_tfs:
+        ctx = closed_map.get(ctx_tf) or []
+        if len(ctx) < 205:
+            # Ana TF EMA200 motoru korunur; kısa HTF geçmişi tüm sinyali kilitlemez.
+            # Bu HTF nötr kabul edilir ve puanlamada aşağıda güven puanı düşürülür.
+            ctx_biases[ctx_tf] = "NEUTRAL"
+            htf_short_tfs.append(ctx_tf)
+        else:
+            ctx_biases[ctx_tf] = _group0_bias(ctx)
+    prim_bias = _group0_bias(prim)
 
     c_data = detect_concepts(prim, atr)
     trig = detect_triggers(prim, atr)
-    closes = [c["close"] for c in prim]
     rsi = calc_rsi(closes, 14)
-    e20, e50 = calc_ema(closes, 20), calc_ema(closes, 50)
     rv3 = recent_rvol(prim, 3)
-    if rsi is None or rv3 is None:
+    rvol_now = _candle_rvol_at(prim, len(prim) - 1, 20)
+    if rsi is None:
+        _note(diag, tf, None, "RSI_VERISI_EKSIK", lts)
         return None
+    if rv3 is None:
+        rv3 = 0.0
+    if rvol_now is None:
+        rvol_now = 0.0
 
     news_risk, news_label = news if news is not None else check_news_window()
-    concept_mults = (learn or {}).get("concept_mults", {}) or {}
-    min_score = max(MIN_SCORE, int((learn or {}).get("min_score", MIN_SCORE)))
+    min_score = int(params.get("min_score", MIN_SCORE))
+    min_score = max(70, min(95, min_score))
+    g4_min_rvol = float(params.get("g4_min_rvol", G4_MIN_RVOL))
+    g5_min_rvol = float(params.get("g5_min_rvol", G5_MIN_RVOL))
+    choch_atr_min = float(params.get("choch_atr_min", G_CHOCH_ATR_MIN))
+    g3_min_rvol = float(params.get("g3_min_rvol", G3_MIN_RVOL))
+    g3_body_min = float(params.get("g3_body_min_atr", G3_MIN_BODY_ATR))
+    high_vol_allowed = high_vol or sideways_regime or transition_regime
+    chase_blocked = abs(float(live_price) - float(last["close"])) > MAX_CHASE_ATR * atr
+    if chase_blocked:
+        _note(diag, tf, None, "KOVALAMA", lts,
+              extra={"distance_atr": round(abs(float(live_price)-float(last["close"])) / atr, 3),
+                     "max_distance_atr": MAX_CHASE_ATR})
 
-    rng_hi = max(c["high"] for c in prim[-60:])
-    rng_lo = min(c["low"] for c in prim[-60:])
-    pos = (live_price - rng_lo) / max(rng_hi - rng_lo, 1e-12)
-
-    sh_main, sl_main = find_swings(prim[-130:], 4, 4)
-    obst_highs = [p for _, p in sh_main]
-    obst_lows = [p for _, p in sl_main]
+    sh_main, sl_main = find_swings(prim[-160:], 2, 2)
+    obstacle_highs = [p for _, p in sh_main]
+    obstacle_lows = [p for _, p in sl_main]
     if ctx_tfs:
-        sh_c, sl_c = find_swings(closed_map[ctx_tfs[0]][-130:], 4, 4)
-        obst_highs += [p for _, p in sh_c]
-        obst_lows += [p for _, p in sl_c]
+        htf_seg = (closed_map.get(ctx_tfs[0]) or [])[-160:]
+        sh_ctx, sl_ctx = find_swings(htf_seg, 2, 2)
+        obstacle_highs += [p for _, p in sh_ctx]
+        obstacle_lows += [p for _, p in sl_ctx]
 
-    best = None
+    rng_hi = max(float(c["high"]) for c in prim[-60:])
+    rng_lo = min(float(c["low"]) for c in prim[-60:])
+    position = (float(live_price) - rng_lo) / max(rng_hi - rng_lo, 1e-12)
+    last_idx = len(prim) - 1
+    reaction_long = _reaction_candle(prim, last_idx, True)
+    reaction_short = _reaction_candle(prim, last_idx, False)
+    cs_long = _close_strength_ok(last, True, G3_MIN_CLOSE_STRENGTH)
+    cs_short = _close_strength_ok(last, False, G3_MIN_CLOSE_STRENGTH)
+    body_atr = abs(float(last["close"]) - float(last["open"])) / max(atr, 1e-12)
+    atr_expanding = atr_ratio >= float(params.get("g3_atr_ratio", G_ATR_EXP))
+    adx_rising = adx > adx_prev
+    slope_min = float(params.get("slope_min", G_SLOPE_MIN))
+    ema_long = e20 > e50 and slope20 is not None and slope20 >= slope_min
+    ema_short = e20 < e50 and slope20 is not None and slope20 <= -slope_min
+
+    candidates = []
+    missing_by_group = {}
+    group_status_by_group = {}
     for side in ("LONG", "SHORT"):
         is_long = side == "LONG"
         want = "BULL" if is_long else "BEAR"
-        opp = "BEAR" if is_long else "BULL"
+        opposite = "BEAR" if is_long else "BULL"
+        primary_htf = ctx_biases.get(ctx_tfs[0]) if ctx_tfs else prim_bias
+        secondary_opposed = any(v == opposite for k, v in ctx_biases.items() if not ctx_tfs or k != ctx_tfs[0])
+        primary_opposed = primary_htf == opposite
+        htf_full = bool(ctx_biases) and all(v == want for v in ctx_biases.values())
+        htf_primary_aligned = primary_htf == want
+        htf_neutral_ok = primary_htf == "NEUTRAL" and not secondary_opposed
+        # Ana HTF karşı yöndeyse trend motorunu durdur; nötrse puanla ve devam et.
+        htf_ok = (htf_primary_aligned or htf_neutral_ok) and not primary_opposed and not secondary_opposed
+        htf_opposed = primary_opposed or secondary_opposed
+        if not ctx_tfs:
+            htf_primary_aligned = prim_bias == want
+            htf_neutral_ok = prim_bias == "NEUTRAL"
+            htf_full = prim_bias == want
+            htf_opposed = prim_bias == opposite
+            htf_ok = htf_primary_aligned or htf_neutral_ok
+        trend_aligned = gate_direction == side and htf_ok
 
-        # --- Ust zaman dilimi yonu (BTC bagimsiz) ---
-        if ctx_tfs:
-            if biases[ctx_tfs[0]] != want or any(biases[t] == opp for t in ctx_tfs[1:]):
-                _note(diag, tf, side, "ÜST_TF_YÖN", lts)
-                continue
-            htf_full = all(biases[t] == want for t in ctx_tfs)
-        else:
-            if prim_bias != want or (e50 and ((is_long and live_price < e50) or ((not is_long) and live_price > e50))):
-                _note(diag, tf, side, "ÜST_TF_YÖN", lts)
-                continue
-            htf_full = True
-
-        # --- Yönlü olaylar: her grup kendi zaman sırasını doğrular ---
-        opposite_break_event = _recent_opposite_structure_break(prim, is_long)
-        opp_bos = opposite_break_event is not None
-        opp_choch = opposite_break_event is not None
-        sweep_event = _sweep_reclaim_confirm(prim, atr, is_long)
-        sweep = sweep_event is not None
+        active_zones = _active_zones(_collect_zones(c_data, side), prim, atr, live_price, side)
+        first_ob_zones = []
+        for z in active_zones:
+            if z[0] == "Order Block":
+                visits = _zone_prior_visits(prim, z[1], z[2], z[3])
+                if visits <= ZONE_MAX_PRIOR_VISITS:
+                    first_ob_zones.append(z)
+        first_fvg_zones = [z for z in active_zones if z[0] == "FVG"]
+        ob_touched = any(
+            any((c["low"] <= z[2] + 0.25 * atr and c["close"] >= z[1] - 0.20 * atr) if is_long
+                else (c["high"] >= z[1] - 0.25 * atr and c["close"] <= z[2] + 0.20 * atr)
+                for c in prim[-5:]) for z in first_ob_zones
+        )
+        fvg_touched = any(
+            any(c["low"] <= z[2] + 0.25 * atr and c["high"] >= z[1] - 0.25 * atr
+                for c in prim[-5:]) for z in first_fvg_zones
+        )
+        impulse_event = _impulse_pullback_reaction(prim, is_long, atr)
         bos_brk = _fresh_bos_level(prim, atr, is_long)
-        bos = bos_brk is not None
-        choch_event = _strong_choch_event(prim, is_long, G_CHOCH_ATR_MIN)
-        choch = choch_event is not None
-        if (opp_choch or opp_bos) and not (choch or sweep):
-            _note(diag, tf, side, "TERS_KIRILIM", lts)
-            continue
-        ict_items = []
-        if choch:
-            ict_items.append(("ICT · Güçlü CHoCH", 3))
-        if bos:
-            ict_items.append(("ICT · BOS", 2))
-        if sweep:
-            ict_items.append(("ICT · Sweep>Yapı Onayı", 3))
-
-        # --- Bölgeler ---
-        act, zone_visits = [], {}
-        for z in _active_zones(_collect_zones(c_data, side), prim, atr, live_price, side):
-            vv = _zone_prior_visits(prim, z[1], z[2], z[3])
-            if vv <= ZONE_MAX_PRIOR_VISITS:
-                act.append(z)
-                zone_visits[z] = vv
-        zt = {z[0] for z in act}
-
-        di_ok = (pdi > mdi) if is_long else (mdi > pdi)
-        ema_al = bool(e20 and e50 and ((is_long and live_price > e50 and e20 > e50)
-                                       or ((not is_long) and live_price < e50 and e20 < e50)))
-        strong_trend = bool(htf_full and prim_bias == want and adx >= ADX_STRONG and di_ok and ema_al)
-
-        lo_r, hi_r = G_RSI_LONG if is_long else G_RSI_SHORT
-        rsi_base = lo_r <= rsi <= hi_r
-        rsi_ext = (not rsi_base) and strong_trend and (
-            (is_long and hi_r < rsi <= RSI_STRONG_LONG_MAX) or ((not is_long) and RSI_STRONG_SHORT_MIN <= rsi < lo_r))
-        eq_event = _equal_sweep_event(prim, atr, is_long)
-        eq_lbl = eq_event.get("label") if eq_event else None
+        bos_retest = _bos_retest_reaction(prim, atr, is_long, bos_brk) if bos_brk else None
+        bos_now = bool(bos_brk and bos_brk[1] == last_idx)
+        volume_sequence, bos_rvol, entry_rvol = (
+            _bos_volume_sequence(prim, bos_brk[1], atr) if bos_retest and bos_brk
+            else (False, None, rvol_now)
+        )
+        eq_event = _equal_sweep_event(prim, atr, is_long, min_rvol=g5_min_rvol)
+        sweep_confirm = _sweep_reclaim_confirm(prim, atr, is_long)
+        choch_event = _strong_choch_event(prim, is_long, choch_atr_min)
+        ce_ok = _ce_ok(prim, atr, live_price, is_long)
+        pd_ok = position <= 0.55 if is_long else position >= 0.45
+        no_eq_ahead = not _equal_liquidity_ahead(prim, atr, is_long, live_price)
         eq_rvol = float(eq_event.get("rvol", 0.0)) if eq_event else 0.0
+        sweep_rvol = eq_rvol if eq_event else None
+        if sweep_confirm:
+            sr = _candle_rvol_at(prim, int(sweep_confirm["sweep_idx"]), 20)
+            if sr is not None:
+                sweep_rvol = max(sweep_rvol or 0.0, sr)
+        current_rvol_ok = rvol_now >= G_MIN_RVOL
+        ema_aligned = ema_long if is_long else ema_short
+        reaction = reaction_long if is_long else reaction_short
+        close_strength = cs_long if is_long else cs_short
+        trend_env = adx >= G_MIN_ADX and gate_direction == side
+        reversal_env = high_vol_allowed and (gate_direction != side or htf_opposed or prim_bias == opposite)
 
-        ob_fvg = any(
-            _z_overlap(z_ob, z_fvg, atr * 0.15)
-            for z_ob in act if z_ob[0] == "Order Block"
-            for z_fvg in act if z_fvg[0] == "FVG")
-        bos_retest_event = _bos_retest_reaction(prim, atr, is_long, bos_brk) if bos_brk else None
-        reaction = _reaction_candle(prim, len(prim) - 1, is_long)
-        impulse_pullback_event = _impulse_pullback_reaction(prim, is_long, atr)
-        first_test_event = _ob_fvg_first_test(prim, act, is_long)
-
-        comp = {
-            "sweep": bool(sweep), "sweep_confirm": bool(sweep_event),
-            "bos": bool(bos_brk), "choch": bool(choch), "choch_strong": bool(choch_event),
-            "zone": bool(zt),
-            "snd_ob": bool(zt & {"Supply & Demand", "Order Block"}),
-            "fvg_ob": bool(zt & {"FVG", "Order Block"}),
-            "ob_fvg": bool(ob_fvg),
-            "retest": bool(bos_retest_event),
+        # Grup 1: OB retest çekirdeği; impulse yalnız kalite teyididir.
+        g1_checks = {
+            "EMA20/50+slope": bool(ema_aligned), "Group0 yön": gate_direction == side,
+            "HTF uyumu veya nötr": bool(htf_ok), "ADX>=18": adx >= G_MIN_ADX,
+            "aktif ilk OB": bool(first_ob_zones), "OB retest": bool(ob_touched),
             "reaction": bool(reaction),
-            "first_test": bool(first_test_event),
-            "impulse_pullback": bool(impulse_pullback_event),
-            "ema20": bool(e20) and abs(live_price - e20) <= G_MAX_EMA20_DIST_ATR * atr,
-            "eq": eq_event is not None,
-            "rvol_e": eq_rvol >= G_E_MIN_RVOL,
-            "ce": _ce_ok(prim, atr, live_price, is_long),
-            "rsi": rsi_base or rsi_ext,  # yalnızca skor/raporlama; A/C uygunluk şartı değildir
-            "cs": _close_strength_ok(last, is_long),
-            "adx": adx >= G_MIN_ADX,
-            "rvol": rv3 >= G_MIN_RVOL,
-            "rvol_d": rv3 >= G_D_MIN_RVOL,
-            "room": False,
         }
+        g1 = all(g1_checks.values())
 
-        # --- Her grubun eksikleri ayrı kaydedilir; tek bir 'best miss' ile bilgi kaybetme ---
-        pre, best_miss, missing_by_group = [], None, {}
-        for code in GROUP_CODES:
-            if regime == "YATAY" and code in GROUP_TREND_ONLY:
-                continue
-            miss = [k for k in GROUP_DEFS[code] if k != "room" and not comp.get(k, False)]
-            if not miss:
-                pre.append(code)
+        # Grup 2: BOS retest + FVG + reaction çekirdek; CE/P-D/hacim sırası puan getirir.
+        g2_checks = {
+            "EMA20/50+slope": bool(ema_aligned), "Group0 yön": gate_direction == side,
+            "HTF uyumu veya nötr": bool(htf_ok), "ADX>=18": adx >= G_MIN_ADX,
+            "BOS retest": bool(bos_retest), "FVG retest": bool(fvg_touched),
+            "reaction": bool(reaction),
+        }
+        g2 = all(g2_checks.values())
+
+        # Grup 3: BOS kapanışı çekirdek; momentum onaylarından en az biri yeterli.
+        close3 = _close_strength_ok(last, is_long, G3_MIN_CLOSE_STRENGTH)
+        g3_checks = {
+            "trend yön kapısı": bool(trend_env), "HTF uyumu veya nötr": bool(htf_ok),
+            "BOS kapanışı": bool(bos_now), f"RVOL>={g3_min_rvol:.2f}": rvol_now >= g3_min_rvol,
+            "ADX yükseliyor veya ATR genişliyor": bool(adx_rising or atr_expanding),
+            "gövde>=0.55 ATR": body_atr >= g3_body_min, "kapanış gücü": bool(close3),
+        }
+        g3 = all(g3_checks.values())
+
+        # Grup 4: sweep + güçlü CHoCH + reversal ortamı; RVOL 1.60 yeterli.
+        g4_checks = {
+            "yatay/geçiş/yüksek-vol reversal": bool(reversal_env), "EQH/EQL sweep": bool(eq_event),
+            "güçlü CHoCH": bool(choch_event), f"sweep RVOL>={g4_min_rvol:.2f}": sweep_rvol is not None and sweep_rvol >= g4_min_rvol,
+            "reaction": bool(reaction),
+        }
+        g4 = all(g4_checks.values())
+
+        # Grup 5: EQ sweep + reclaim + yönlü yapı teyidi.
+        g5_checks = {
+            "trend yön kapısı": bool(trend_env), "HTF uyumu veya nötr": bool(htf_ok),
+            "EQH/EQL sweep": bool(eq_event), "sweep reclaim": bool(sweep_confirm),
+            "BOS/CHoCH": bool(bos_brk or choch_event), f"sweep RVOL>={g5_min_rvol:.2f}": eq_rvol >= g5_min_rvol,
+            "reaction": bool(reaction),
+        }
+        g5 = all(g5_checks.values())
+
+        # Grup 6: bağımsız motor değil, eşlik eden confluence.
+        ob_fvg_overlap = any(
+            _z_overlap(ob, fvg, atr * 0.15)
+            for ob in active_zones if ob[0] == "Order Block"
+            for fvg in active_zones if fvg[0] == "FVG"
+        )
+        first_overlap_test = _ob_fvg_first_test(prim, active_zones, is_long)
+        g6_layer = bool(gate_direction == side and ob_fvg_overlap and first_overlap_test
+                        and reaction and (pd_ok or ce_ok))
+
+        # Grup 7: momentum devamı; RSI ve hacim eşikleri nefes alır.
+        rsi_side_ok = (rsi >= 48.0) if is_long else (rsi <= 52.0)
+        g7_checks = {
+            "trend yön kapısı": bool(trend_env), "HTF uyumu veya nötr": bool(htf_ok),
+            "EMA20/50+slope": bool(ema_aligned), "ADX>=18": adx >= G_MIN_ADX,
+            "RSI yönü": bool(rsi_side_ok), "RVOL>=0.90": current_rvol_ok,
+            "3-5 itki / 2-4 geri çekilme": bool(impulse_event), "reaction": bool(reaction),
+        }
+        g7 = all(g7_checks.values())
+
+        checks_by_group = {"1": g1_checks, "2": g2_checks, "3": g3_checks,
+                           "4": g4_checks, "5": g5_checks, "7": g7_checks}
+        ok_by_group = {"1": g1, "2": g2, "3": g3, "4": g4, "5": g5, "7": g7}
+        passed = []
+        for code in GROUP_SIGNAL_CODES:
+            ok = bool(ok_by_group.get(code))
+            group_status_by_group[f"{side}:{code}"] = ok
+            if ok:
+                passed.append(code)
             else:
-                missing_by_group[code] = miss
-                if best_miss is None or len(miss) < len(best_miss[1]):
-                    best_miss = (code, miss)
-        if not pre:
-            _note(diag, tf, side, "GRUP_YOK", lts, extra={"missing_by_group": missing_by_group})
+                failed_checks = [name for name, condition in checks_by_group[code].items() if not condition]
+                missing_by_group[f"{side}:{code}"] = failed_checks
+
+        if g6_layer and passed:
+            passed.append("6")
+        passed.sort(key=lambda code: GROUP_CODES.index(code))
+        if not passed or all(c == "6" for c in passed):
+            continue
+        if chase_blocked:
+            _note(diag, tf, side, "KOVALAMA", lts, blocks=["KOVALAMA"], stage="hard")
             continue
 
-        # --- Onay mumu: yonde kapanis + kapanis mumun ilgili yarisinda ---
-        if not _close_strength_ok(last, is_long, G_CONFIRM_CLOSE_THR):
-            _note(diag, tf, side, "ONAY_MUMU", lts)
-            continue
-
-        # --- Stop referansi: en iyi bolge, yoksa son 5 mum ---
-        best_grp, zone_fresh = set(), False
-        if act:
-            tolz = atr * 0.15
-            best_z, best_key = None, None
-            for z in act:
-                grp = {z2[0] for z2 in act if _z_overlap(z, z2, tolz)}
-                key = (len(grp), -abs(live_price - (z[1] + z[2]) / 2.0))
-                if best_key is None or key > best_key:
-                    best_z, best_grp, best_key = z, grp, key
-            group_zs = [z2 for z2 in act if _z_overlap(best_z, z2, tolz)]
-            zlo = min(z2[1] for z2 in group_zs)
-            zhi = max(z2[2] for z2 in group_zs)
-            zone_fresh = any(zone_visits.get(z2, 1) == 0 for z2 in group_zs)
+        # Stop: yapısal seviye + tanımlı ATR tamponu; min stop uygulandıktan sonra max kontrol.
+        best_z = min(active_zones, key=lambda z: abs(float(live_price) - (z[1] + z[2]) / 2.0)) if active_zones else None
+        if best_z:
+            zone_lo, zone_hi = float(best_z[1]), float(best_z[2])
+            zone_fresh = best_z in first_ob_zones or best_z in first_fvg_zones
         else:
-            zlo = min(c["low"] for c in prim[-5:])
-            zhi = max(c["high"] for c in prim[-5:])
-
-        blocks, relaxed = [], []
-
-        # RSI A/C uygunluk şartı veya gizli global veto değildir; yalnızca mevcut skor katkısı raporlanır.
-
-        # Premium / Discount: donus gruplari (A, C, E) esnetilmez; devam gruplari (B, D, F) sinirli esner
-        pd_fail = (is_long and pos > PD_LONG_MAX) or ((not is_long) and pos < PD_SHORT_MIN)
-        pd_ext = False
-        if pd_fail:
-            ext_ok = (strong_trend or htf_full) and (
-                (is_long and pos <= PD_STRONG_LONG_MAX) or ((not is_long) and pos >= PD_STRONG_SHORT_MIN))
-            cont = [c for c in pre if c in GROUP_TREND_ONLY] if ext_ok else []
-            if cont:
-                pre = cont          # donus gruplari bu kurulumdan dusurulur
-                pd_ext = True
-                relaxed.append("P/D uzama")
-            else:
-                blocks.append("PREMIUM_DISCOUNT")
-
-        # Stop / hedef / maliyet
-        entry = live_price
+            zone_lo = min(float(c["low"]) for c in prim[-5:])
+            zone_hi = max(float(c["high"]) for c in prim[-5:])
+            zone_fresh = False
+        entry = float(live_price)
+        stop_buffer = float(params.get("stop_buffer_atr", STOP_BUFFER_ATR)) * atr
+        min_stop_dist = float(params.get("min_stop_atr", MIN_STOP_ATR)) * atr
+        max_stop_dist = float(params.get("max_stop_atr", MAX_STOP_ATR)) * atr
         if is_long:
-            sl_raw = min(zlo, min(c["low"] for c in prim[-5:])) - STOP_BUFFER_ATR * atr
-            risk = entry - sl_raw
+            sl_raw = min(zone_lo, min(float(c["low"]) for c in prim[-5:])) - stop_buffer
+            structural_risk = entry - sl_raw
         else:
-            sl_raw = max(zhi, max(c["high"] for c in prim[-5:])) + STOP_BUFFER_ATR * atr
-            risk = sl_raw - entry
-        if risk <= 0:
-            _note(diag, tf, side, "STOP_GEÇERSİZ", lts)
+            sl_raw = max(zone_hi, max(float(c["high"]) for c in prim[-5:])) + stop_buffer
+            structural_risk = sl_raw - entry
+        if structural_risk <= 0:
+            _note(diag, tf, side, "STOP_GEÇERSİZ", lts, stage="hard")
             continue
-        if risk > MAX_STOP_ATR * atr:
-            sh = _risk_filter_shadow_candidate(meta, tf, side, entry, sl_raw, atr, last, "STOP_GENİŞ")
-            _note(diag, tf, side, "STOP_GENİŞ", lts, blocks=["STOP_GENİŞ"] + blocks,
-                  cand=sh, stage="setup")
+        risk = max(structural_risk, min_stop_dist)
+        if risk > max_stop_dist:
+            shadow_sl = entry - risk if is_long else entry + risk
+            sh = _risk_filter_shadow_candidate(meta, tf, side, entry, shadow_sl, atr, last, "STOP_GENİŞ")
+            _note(diag, tf, side, "STOP_GENİŞ", lts, blocks=["STOP_GENİŞ"], cand=sh, stage="setup")
             continue
-        risk = max(risk, MIN_STOP_ATR * atr)
         sl = entry - risk if is_long else entry + risk
         if sl <= 0:
             continue
         risk_pct = risk / entry * 100.0
-        if risk_pct > MAX_STOP_PCT.get(tf, 3.5):
-            sh = _risk_filter_shadow_candidate(meta, tf, side, entry, sl, atr, last, "STOP_YÜZDE")
-            _note(diag, tf, side, "STOP_YÜZDE", lts, blocks=["STOP_YÜZDE"] + blocks,
-                  cand=sh, stage="setup")
-            continue
-        cost_r = roundtrip_cost_pct(tf) / max(risk_pct, 1e-9)
-        if cost_r > MAX_COST_R:
-            blocks.append("MALİYET")
-        sgn = 1.0 if is_long else -1.0
-        tp1, tp2, tp3 = (entry + sgn * risk * m for m in TP_R)
-        if min(tp1, tp2, tp3) <= 0:
+        if risk_pct > MAX_STOP_PCT.get(tf, 5.5):
+            _note(diag, tf, side, "STOP_YÜZDE", lts, blocks=["STOP_YÜZDE"], stage="hard",
+                  extra={"risk_pct": round(risk_pct, 3), "max_pct": MAX_STOP_PCT.get(tf, 5.5)})
             continue
 
-        room_price = None
+        # ROOM: Grup 2/3 için sıkı yapısal alan, diğer gruplar için taban alan.
         if is_long:
-            above = [p for p in obst_highs if p > entry + 0.05 * atr]
-            if above:
-                room_price = min(above)
-                room_r = (room_price - entry) / risk
-                swing_move_pct = (room_price - entry) / entry * 100.0
-            else:
-                room_r, swing_move_pct = None, None
+            ahead = [float(p) for p in obstacle_highs if float(p) > entry + 0.05 * atr]
+            room_price = min(ahead) if ahead else None
+            room_r = (room_price - entry) / risk if room_price is not None else None
         else:
-            below = [p for p in obst_lows if p < entry - 0.05 * atr]
-            if below:
-                room_price = max(below)
-                room_r = (entry - room_price) / risk
-                swing_move_pct = (entry - room_price) / entry * 100.0
-            else:
-                room_r, swing_move_pct = None, None
-        tp3_move_pct = abs(tp3 - entry) / max(entry, 1e-9) * 100.0
-        pot_pct = min(swing_move_pct, tp3_move_pct) if swing_move_pct is not None else None
+            ahead = [float(p) for p in obstacle_lows if float(p) < entry - 0.05 * atr]
+            room_price = max(ahead) if ahead else None
+            room_r = (entry - room_price) / risk if room_price is not None else None
+        sign = 1.0 if is_long else -1.0
+        tp1, tp2, tp3 = (entry + sign * risk * m for m in TP_R)
+        tp3_pct = abs(tp3 - entry) / max(entry, 1e-12) * 100.0
+        room_pct = (abs(room_price - entry) / entry * 100.0) if room_price is not None else None
+        pot_pct = min(room_pct, tp3_pct) if room_pct is not None else None
 
-        # Alan bilinmiyorsa uydurma potansiyel üretme. O durumda A/C/E taban alanı da doğrulanamaz.
-        room_full = room_r is not None and room_r >= G_MIN_ROOM_R and pot_pct is not None and pot_pct >= G_MIN_POT_PCT
-        room_base = room_r is not None and room_r >= G_BASE_ROOM_R
-        matched = [c for c in pre if (room_full if "room" in GROUP_DEFS[c] else room_base)]
-        if not matched:
-            blocks.append("ALAN(ROOM)")
-            matched = list(pre)
-        comp["room"] = room_full
+        strict_room_groups = set(passed) & {"2", "3"}
+        base_room_groups = set(passed) - {"2", "3", "6"}
+        if strict_room_groups and (room_r is None or room_r < float(params.get("min_room_r", G_MIN_ROOM_R))
+                                   or pot_pct is None or pot_pct < float(params.get("min_pot_pct", G_MIN_POT_PCT))):
+            for code in list(strict_room_groups):
+                passed.remove(code)
+                missing_by_group[f"{side}:{code}" ] = missing_by_group.get(f"{side}:{code}", []) + [f"ROOM>={float(params.get('min_room_r', G_MIN_ROOM_R)):.2f}R"]
+                group_status_by_group[f"{side}:{code}"] = False
+        if base_room_groups and (room_r is None or room_r < float(params.get("base_room_r", G_BASE_ROOM_R))
+                                 or pot_pct is None or pot_pct < float(params.get("base_pot_pct", G_BASE_POT_PCT))):
+            blocks = ["ALAN(ROOM)"]
+        elif strict_room_groups and not any(c in passed for c in ("2", "3")) and not base_room_groups:
+            blocks = ["ALAN(ROOM)"]
+        else:
+            blocks = []
+        if not any(c != "6" for c in passed):
+            if blocks:
+                sh = _risk_filter_shadow_candidate(meta, tf, side, entry, sl, atr, last, "ALAN(ROOM)")
+                if sh:
+                    sh.update({"room_r": round(room_r, 2) if room_r is not None else None,
+                               "pot_pct": round(pot_pct, 2) if pot_pct is not None else None,
+                               "room_price": rp(room_price) if room_price is not None else None,
+                               "grp_matched": list(passed), "grp_ver": 3})
+                _note(diag, tf, side, "SOFT", lts, blocks=blocks, cand=sh, stage="setup")
+            continue
 
-        rsi_used = bool(rsi_ext and any("rsi" in GROUP_DEFS[c] for c in matched))
-        if rsi_used:
-            relaxed.append("RSI uzama")
+        # İşlem maliyeti raporlanır; V5.1'de maliyet/spread sinyal kapısı değildir.
+        cost_r = roundtrip_cost_pct(tf) / max(risk_pct, 1e-9)
+        strong_reversal = "4" in passed and bool(eq_event and choch_event and sweep_rvol is not None and sweep_rvol >= g4_min_rvol)
 
-        short_z = {"Order Block": "OB", "FVG": "FVG", "Supply & Demand": "S&D"}
-
-        def zlbl(*names):
-            return "/".join(short_z[g] for g in names if g in zt) or "Bölge"
-
-        lbl = {
-            "sweep": "Sweep", "sweep_confirm": "Sweep>Yapı Onayı",
-            "bos": "BOS", "choch": "CHoCH", "choch_strong": f"CHoCH {choch_event.get('body_atr', 0):.2f} ATR" if choch_event else "CHoCH",
-            "zone": zlbl("Order Block", "FVG", "Supply & Demand"),
-            "snd_ob": zlbl("Supply & Demand", "Order Block"),
-            "fvg_ob": zlbl("FVG", "Order Block"),
-            "ob_fvg": "OB+FVG Çakışma",
-            "retest": "BOS Retest", "reaction": "Tepki Mumu",
-            "first_test": "OB+FVG İlk Test", "impulse_pullback": "Hacimli İtki+Düşük Hacimli Düzeltme",
-            "ema20": "EMA20 Yakın",
-            "eq": eq_lbl or "EQ Süpürme", "rvol_e": f"Sweep RVol {eq_rvol:.2f}x",
-            "ce": "CE 50%", "rsi": f"RSI {rsi:.0f}", "cs": "Kapanış Gücü",
-            "adx": f"ADX {adx:.0f}", "rvol": f"RVol {rv3:.2f}x", "rvol_d": f"RVol {rv3:.2f}x",
-            "room": f"Alan {room_r:.1f}R" if room_r is not None else "Alan bilinmiyor",
-        }
-        abcd_groups = {c: [lbl[k] for k in GROUP_DEFS[c]] for c in matched}
-        code_str = "".join(matched)
-
-        # ---------------- PUANLAMA ----------------
-        sweet = (44.0 <= rsi <= 62.0) if is_long else (38.0 <= rsi <= 56.0)
-        deep = (pos <= 0.35) if is_long else (pos >= 0.65)
-        score = 60.0 + min(20, 14 + 3 * (len(matched) - 1))
-        score += min(8, 4 * min(2, max(0, len(best_grp) - 1)) + (2 if zone_fresh else 0))
-        htf_pts = ((6 if len(ctx_tfs) >= 2 else 4) if htf_full else 3)
-        adx_pts = 4 if adx >= 30 else (3 if adx >= ADX_STRONG else (1 if adx >= MIN_ADX else 0))
-        score += min(12, htf_pts + adx_pts + (2 if di_ok else 0))
-        score += 4 if rv3 >= 1.5 else (3 if rv3 >= 1.25 else 1)
-        rsi_score_points = 2 if sweet else 0
-        deep_score_points = 2 if deep else 0
-        score += min(3, rsi_score_points + deep_score_points)
-        score += 4 if (room_r is not None and pot_pct is not None and room_r >= 3.5 and pot_pct >= 3.5) else (2 if room_r is not None and room_r >= 2.6 else 0)
-        if rsi_used:
-            score -= 3
-        if pd_ext:
-            score -= 2
-        groups = set(best_grp) | ({"ICT"} if ict_items else set())
-        if groups:
-            mults = [concept_mults.get(g, 1.0) for g in groups]
-            score += round((sum(mults) / len(mults) - 1.0) * 16)
-        score += _tf_hist_bonus(learn, tf)
-        score += _group_hist_bonus(learn, matched)
+        # 100 puan kalite skoru: ana strateji şartları grupta zorunlu, ikincil teyitler puanlanır.
+        if htf_full:
+            htf_points = 15
+        elif htf_primary_aligned:
+            htf_points = 13
+        elif htf_neutral_ok:
+            htf_points = 8
+        else:
+            htf_points = 4 if "4" in passed else 0
+        adx_points = 15 if adx >= 25 else 13 if adx >= 22 else 11 if adx >= 20 else 9 if adx >= 18 else 0
+        score_rvol = max(rvol_now, float(sweep_rvol or 0.0))
+        rvol_points = 15 if score_rvol >= 1.50 else 13 if score_rvol >= 1.20 else 11 if score_rvol >= 1.00 else 8 if score_rvol >= 0.90 else 3
+        if is_long:
+            rsi_points = 10 if 48 <= rsi <= 70 else 7 if 44 <= rsi <= 74 else 3
+        else:
+            rsi_points = 10 if 30 <= rsi <= 52 else 7 if 26 <= rsi <= 56 else 3
+        if ema_aligned:
+            ema_points = 10 if abs(slope20 or 0.0) >= 0.10 else 8
+        else:
+            ema_points = 6 if "4" in passed and choch_event else 2
+        reaction_points = (9 if reaction else 0) + (6 if close_strength else 0)
+        if g6_layer:
+            confluence_points = 10
+        elif any(z[0] == "Order Block" for z in active_zones) and any(z[0] == "FVG" for z in active_zones):
+            confluence_points = 7
+        elif active_zones:
+            confluence_points = 5
+        else:
+            confluence_points = 0
+        pd_points = 10 if pd_ok else 6 if 0.30 <= position <= 0.70 else 0
+        score = htf_points + adx_points + rvol_points + rsi_points + ema_points + reaction_points + confluence_points + pd_points
+        if "3" in passed and (adx_rising or atr_expanding) and no_eq_ahead:
+            score += 3
+        if "4" in passed:
+            score += 5  # reversal için HTF/EMA karşı-yön cezasını kısmen dengeler
         if news_risk:
-            score -= 6
-        if risk / atr > 2.0:
-            score -= 2
-        if regime == "YATAY":
-            score -= 2
+            score -= 4
+        if transition_regime:
+            score -= 1
+        if htf_short_tfs:
+            score -= min(6, 3 * len(htf_short_tfs))
         final_score = int(max(0, min(MAX_SCORE_CAP, round(score))))
         if final_score < min_score:
             blocks.append("SKOR")
 
-        if blocks and diag is None:
-            continue
-
-        scen_label = f"Grup {code_str}"
-        labels = [f"{tf} {scen_label}"]
-        labels += [f"Grup {c} ✓ {'+'.join(abcd_groups[c])}" for c in matched]
-        labels += [f"{tf} {g}" for g in MAIN_CONCEPTS if g in best_grp]
-        labels += [f"{tf} {n}" for n, _ in ict_items]
+        group_details = {
+            "1": ["EMA20/50 + eğim", "Grup 0 yönü", "HTF uyumu/nötr", "ADX>=18", "ilk OB retest", "reaction", "impulse opsiyonel teyit"],
+            "2": ["EMA20/50 + eğim", "Grup 0 yönü", "HTF uyumu/nötr", "ADX>=18", "BOS retest", "FVG retest", "CE50/P-D/hacim puanlaması"],
+            "3": ["BOS kapanışı", "RVOL>=1.20", "ADX veya ATR genişlemesi", "gövde>=0.55 ATR", "kapanış gücü"],
+            "4": ["yatay/geçiş/yüksek-vol", "EQH/EQL sweep", "güçlü CHoCH", "sweep RVOL>=1.60", "reaction"],
+            "5": ["EQ sweep", "sweep reclaim", "BOS/CHoCH", "trend yönü", "RVOL>=0.90", "reaction"],
+            "6": ["EMA200/DI yönü", "OB+FVG çakışması", "ilk temas", "P/D veya CE50", "reaction"],
+            "7": ["EMA eğimi", "RSI yönü 48/52", "RVOL>=0.90", "3-5 itki / 2-4 geri çekilme", "ADX>=18", "HTF uyumu/nötr"],
+        }
+        labels = [f"{tf} Grup {'+'.join(passed)}"]
+        labels += [f"Grup {c} ✓ {'+'.join(group_details[c])}" for c in passed]
         if ctx_tfs:
-            labels += [f"HTF {t} {'↑' if biases[t] == 'BULL' else ('↓' if biases[t] == 'BEAR' else '→')}" for t in ctx_tfs]
-        htf_txt = " / ".join(
-            f"{t} {'yükseliş' if b == 'BULL' else ('düşüş' if b == 'BEAR' else 'nötr')}" for t, b in biases.items()
-        ) if ctx_tfs else f"{tf} trend uyumlu"
-        grp_txt = " | ".join(f"Grup {c} ({GROUP_SHORT[c]}): {'+'.join(abcd_groups[c])}" for c in matched)
-        relax_txt = (f" Esnetilen koşul: {', '.join(relaxed)} (güçlü trend/yapı teyidiyle)." if relaxed else "")
-        ai_reason = (
-            f"{meta['pair']} SWAP ({tf} · {scen_label}) {side} [BTC Bağımsız]: üst TF {htf_txt}. "
-            f"{grp_txt}. "
-            f"Hedef yolunda {('~' + format(room_r, '.1f') + 'R (~%' + format(pot_pct, '.1f') + ') alan') if room_r is not None and pot_pct is not None else 'doğrulanmış engel alanı bilinmiyor'}. "
-            f"Stop yapı arkasında (%{risk_pct:.2f}), tahmini maliyet {cost_r:.2f}R.{relax_txt} {news_label}."
-        )
-        invalidation = (
-            f"Fiyat {rp(sl)} altında kapanış/temas yaparsa geçersizdir." if is_long
-            else f"Fiyat {rp(sl)} üzerinde kapanış/temas yaparsa geçersizdir."
-        )
+            labels += [f"HTF {t} {'↑' if ctx_biases[t] == 'BULL' else ('↓' if ctx_biases[t] == 'BEAR' else '→')}" for t in ctx_tfs]
+        labels += [f"Group 0: {regime} · ADX {adx:.1f} · ATR ratio {atr_ratio:.2f} · EMA200 {gate_direction or 'NÖTR'}"]
 
+        htf_text = " / ".join(f"{t}:{'BULL' if b == 'BULL' else 'BEAR' if b == 'BEAR' else 'NEUTRAL'}" for t, b in ctx_biases.items()) or f"{tf}:{prim_bias}"
+        if htf_short_tfs:
+            htf_text += f" (kısa geçmiş: {','.join(htf_short_tfs)}; puan cezası uygulandı)"
+        room_text = f"{room_r:.1f}R / %{pot_pct:.2f}" if room_r is not None and pot_pct is not None else "bilinmiyor"
+        ai_reason = (
+            f"{meta['pair']} ({tf}) {side}: Grup 0 rejim={regime}, yön={gate_direction or 'nötr'}, "
+            f"ADX={adx:.1f}, DI+={pdi:.1f}, DI-={mdi:.1f}, EMA200={e200:.6g}, ATR/ortalama={atr_ratio:.2f}. "
+            f"HTF: {htf_text}. Aktif gruplar: {'+'.join(passed)}. ROOM: {room_text}. "
+            f"Stop {risk / atr:.2f} ATR; tahmini maliyet {cost_r:.2f}R (sinyal engeli değil). "
+            f"Önerilen risk katsayısı: {'0.5x (reversal)' if strong_reversal else '1.0x'}. {news_label}."
+        )
+        invalidation = f"Fiyat {rp(sl)} altına inerse geçersizdir." if is_long else f"Fiyat {rp(sl)} üzerine çıkarsa geçersizdir."
         now_local = datetime.now()
+        risk_multiplier = 0.50 if strong_reversal else 1.0
         cand = {
             "id": f"{meta['id']}-{tf}-{last['ts']}-{side}",
-            "symbol": meta["id"],
-            "pair": meta["pair"],
-            "tf": tf,
-            "tf_chain": f"Oto-TF ({tf}) · {scen_label} · Üst TF: {', '.join(ctx_tfs) if ctx_tfs else tf}",
-            "side": side,
-            "entry": rp(entry), "sl": rp(sl), "sl_orig": rp(sl),
+            "symbol": meta["id"], "pair": meta["pair"], "tf": tf,
+            "tf_chain": f"Group 0 + Grup {'+'.join(passed)} · Üst TF: {', '.join(ctx_tfs) if ctx_tfs else tf}",
+            "side": side, "entry": rp(entry), "sl": rp(sl), "sl_orig": rp(sl),
             "tp1": rp(tp1), "tp2": rp(tp2), "tp3": rp(tp3),
-            "rr": TP_R[1],
-            "rr1": TP_R[0], "rr2": TP_R[1],
+            "rr": TP_R[1], "rr1": TP_R[0], "rr2": TP_R[1],
             "rr_levels": {"tp1": TP_R[0], "tp2": TP_R[1], "tp3": TP_R[2]},
-            "risk_pct": round(risk_pct, 3),
-            "cost_r": round(cost_r, 3),
+            "risk_pct": round(risk_pct, 3), "risk_multiplier": risk_multiplier,
+            "risk_pct_suggested": round(risk_pct * risk_multiplier, 3),
+            "cost_r": round(cost_r, 3), "cost_pct_est": roundtrip_cost_pct(tf, ),
+            "cost_source": "sabit araştırma varsayımı; sinyal kapısı değil",
             "room_r": round(room_r, 2) if room_r is not None else None,
             "pot_pct": round(pot_pct, 2) if pot_pct is not None else None,
             "room_price": rp(room_price) if room_price is not None else None,
-            "atr_value": rp(atr),
+            "atr_value": rp(atr), "adx": round(adx, 1), "rsi": round(rsi, 1),
+            "rvol": round(float(rvol_now), 2), "atr_ratio": round(atr_ratio, 3), "ema200": rp(e200),
+            "group0": {"regime": regime, "direction": gate_direction, "adx": round(adx, 2),
+                       "plus_di": round(pdi, 2), "minus_di": round(mdi, 2),
+                       "atr_ratio": round(atr_ratio, 3), "dead_vol": False,
+                       "htf_short_history": list(htf_short_tfs)},
             "event_times": {
-                "sweep_ts": sweep_event.get("sweep_ts") if sweep_event else None,
-                "sweep_confirm_ts": sweep_event.get("confirm_ts") if sweep_event else None,
+                "sweep_ts": sweep_confirm.get("sweep_ts") if sweep_confirm else None,
+                "sweep_confirm_ts": sweep_confirm.get("confirm_ts") if sweep_confirm else None,
                 "choch_ts": choch_event.get("ts") if choch_event else None,
-                "bos_ts": bos_retest_event.get("bos_ts") if bos_retest_event else None,
-                "retest_ts": bos_retest_event.get("retest_ts") if bos_retest_event else None,
-                "reaction_ts": last.get("ts") if reaction else None,
+                "bos_ts": bos_retest.get("bos_ts") if bos_retest else (last["ts"] if bos_now else None),
+                "retest_ts": bos_retest.get("retest_ts") if bos_retest else None,
+                "reaction_ts": last["ts"] if reaction else None,
                 "eq_sweep_ts": eq_event.get("ts") if eq_event else None,
-                "first_zone_test_ts": first_test_event.get("touch_ts") if first_test_event else None,
+                "first_zone_test_ts": first_overlap_test.get("touch_ts") if first_overlap_test else None,
             },
-            "adx": round(adx, 1),
-            "rsi": round(rsi, 1),
-            "indicator_contributions": {
-                "rsi_score_points_raw": rsi_score_points,
-                "deep_location_score_points_raw": deep_score_points,
-                "adx_score_points": adx_pts,
-                "rvol_score_points": 4 if rv3 >= 1.5 else (3 if rv3 >= 1.25 else 1),
-                "note": "RSI/ADX A-F uygunluk engeli değildir; mevcut ortak skora katkıları şeffaftır."
-            },
-            "score": final_score,
-            "confirmations": len(matched) + len(groups),
-            "abcd_groups": abcd_groups,
-            "abcd_code": code_str,
-            "grp_matched": list(matched),
-            "missing_by_group": {k: list(v) for k, v in missing_by_group.items()},
-            "grp_ver": 2,
-            "concepts": list(dict.fromkeys(labels))[:16],
-            "regime": regime,
-            "ai_reason": ai_reason,
-            "invalidation": invalidation,
-            "validity_status": "GEÇERLİ",
-            "time": now_local.strftime("%H:%M:%S"),
+            "score": final_score, "confirmations": len([c for c in passed if c != "6"]),
+            "score_components": {"htf": htf_points, "adx": adx_points, "rvol": rvol_points,
+                                 "rsi": rsi_points, "ema_slope": ema_points,
+                                 "reaction_cs": reaction_points, "ob_fvg": confluence_points,
+                                 "premium_discount": pd_points,
+                                 "htf_short_history_penalty": min(6, 3 * len(htf_short_tfs))},
+            "abcd_groups": {c: group_details[c] for c in passed},
+            "abcd_code": "+".join(passed), "grp_matched": list(passed), "grp_ver": 3,
+            "missing_by_group": missing_by_group, "concepts": labels[:20],
+            "regime": regime, "ai_reason": ai_reason, "invalidation": invalidation,
+            "validity_status": "GEÇERLİ", "time": now_local.strftime("%H:%M:%S"),
             "date_time": now_local.strftime("%d.%m.%Y %H:%M:%S"),
-            "created_ts_ms": now_ms(),
-            "candle_ts": last["ts"],
-            "last_processed_candle_ts": last["ts"],
-            "status": "BEKLIYOR",
-            "stage": 0,
-            "pnl_r": 0.0,
-            "mode": mode,
-            "relaxed": relaxed,
-            "strong_trend": strong_trend,
+            "created_ts_ms": now_ms(), "candle_ts": last["ts"],
+            "last_processed_candle_ts": last["ts"], "status": "BEKLIYOR",
+            "stage": 0, "pnl_r": 0.0, "mode": mode or "groups",
+            "relaxed": [], "strong_trend": bool(trend_aligned and adx >= 25.0),
+            "strong_reversal": strong_reversal, "htf_biases": ctx_biases,
+            "volume_sequence": bool(volume_sequence), "impulse_pullback": bool(impulse_event),
+            "g6_confluence": bool(g6_layer),
         }
         if blocks:
-            shadow_ok = not (blocks == ["SKOR"] and final_score < min_score - SHADOW_MIN_SCORE_GAP)
-            cand["blocked_by"] = list(blocks)
-            _note(diag, tf, side, "SOFT", lts, blocks=blocks, cand=(cand if shadow_ok else None), stage="setup")
+            cand["blocked_by"] = list(dict.fromkeys(blocks))
+            _note(diag, tf, side, "SOFT", lts, blocks=cand["blocked_by"], cand=cand, stage="setup")
             continue
-        if not best or _cand_priority(cand) > _cand_priority(best):
-            best = cand
-    return best
+        candidates.append(cand)
 
+    if not candidates:
+        _note(diag, tf, None, "GRUP0_7_KURULUM_YOK", lts,
+              extra={"regime": regime, "direction": gate_direction, "adx": round(adx, 1),
+                     "atr_ratio": round(atr_ratio, 3), "missing_by_group": missing_by_group,
+                     "group_status_by_group": group_status_by_group})
+        return None
+    else:
+        _note(diag, tf, None, "GRUP_KONTROL_OZET", lts, stage="hard",
+              extra={"missing_by_group": missing_by_group,
+                     "group_status_by_group": group_status_by_group})
+
+    # Aynı sembol/mumda en kaliteli aday; aynı yönlü devam motoru güçlü trendde önde.
+    strong_reversals = [c for c in candidates if c.get("strong_reversal")]
+    trend_candidates = [c for c in candidates if set(c.get("grp_matched") or []) & set(GROUP_TREND_ONLY)]
+    if adx > 25.0 and trend_candidates:
+        pool = trend_candidates
+    elif strong_reversals:
+        pool = strong_reversals
+    else:
+        pool = candidates
+    return max(pool, key=lambda c: (int(c.get("score", 0)), len(c.get("grp_matched") or []),
+                                    float(c.get("room_r") or 0.0),
+                                    1 if c.get("side") == gate_direction else 0))
 
 def _candidate_expected_net_r(sig, learn, min_group_n=20, prior_n=30):
     """Yalnız yeterli örneklemde, grup expectancy'sini küçülterek tahmin eder; olasılık/garanti değildir."""
     rows = {r.get("code"): r for r in ((learn or {}).get("groups_table") or [])}
     estimates, samples = [], []
     for code in (sig.get("grp_matched") or []):
+        if code in GROUP_LAYER_CODES:
+            continue
         row = rows.get(code) or {}
         n = int(row.get("win", 0)) + int(row.get("loss", 0))
         if n < min_group_n:
@@ -2439,7 +2572,7 @@ def _candidate_expected_net_r(sig, learn, min_group_n=20, prior_n=30):
 
 
 def evaluate_signal_for_tf(meta, tf, closed_map, live_price, btc_bias, learn, news=None, mode=None, diag=None):
-    """A-F motoru; geçmiş performans sıralaması yalnız yeterli örneklemde etkinleşir."""
+    """1–7 motoru; geçmiş performans sıralaması yalnız yeterli örneklemde etkinleşir."""
     mode = mode or STRATEGY_MODE
     if mode == "groups":
         sig = _evaluate_signal_groups(meta, tf, closed_map, live_price, btc_bias, learn, news=news, mode=mode, diag=diag)
@@ -2489,31 +2622,35 @@ def evaluate_signal_all_tfs(meta, tf_closed_map, live_price, btc_bias_map, learn
 
 def reanchor_signal(sig, px):
     is_long = sig["side"] == "LONG"
-    risk_old = abs(sig["entry"] - sig["sl"])
-    risk_new = (px - sig["sl"]) if is_long else (sig["sl"] - px)
+    risk_old = abs(float(sig["entry"]) - float(sig["sl"]))
+    risk_new = (float(px) - float(sig["sl"])) if is_long else (float(sig["sl"]) - float(px))
     atr_anchor = float(sig.get("atr_value") or 0.0)
-    if atr_anchor > 0 and abs(float(px) - float(sig["entry"])) > MAX_CHASE_ATR * atr_anchor:
+    s = dict(sig)
+    is_group_v3 = int(s.get("grp_ver", 0) or 0) >= 3
+    chase_limit = MAX_CHASE_ATR if is_group_v3 else LEGACY_MAX_CHASE_ATR
+    stop_pct_limits = MAX_STOP_PCT if is_group_v3 else LEGACY_MAX_STOP_PCT
+    if atr_anchor > 0 and abs(float(px) - float(sig["entry"])) > chase_limit * atr_anchor:
         return None
     if risk_old <= 0 or risk_new <= 0 or risk_new < 0.70 * risk_old or risk_new > 1.35 * risk_old:
         return None
-    risk_pct = risk_new / px * 100.0
-    if risk_pct > MAX_STOP_PCT.get(sig.get("tf", "4H"), 3.5):
+    risk_pct = risk_new / float(px) * 100.0
+    if risk_pct > stop_pct_limits.get(sig.get("tf", "4H"), 5.5):
         return None
-    s = dict(sig)
     if s.get("funding_rate") is not None:
         hold_h = expire_candles_for_tf(s.get("tf", "4H")) * TF_SEC.get(s.get("tf", "4H"), 14400) / 3600.0 * 0.5
         interval_h = max(1.0, float(s.get("funding_interval_hours") or 8.0))
         rate = float(s.get("funding_rate") or 0.0)
         payer_rate = max(0.0, rate if is_long else -rate)
         funding_cost_pct = payer_rate * 100.0 * hold_h / interval_h
-        total_cost_pct = ROUNDTRIP_COST_PCT + funding_cost_pct + float(s.get("spread_pct") or 0.0)
+        total_cost_pct = ROUNDTRIP_COST_PCT + funding_cost_pct
         s["funding_cost_pct"] = round(funding_cost_pct, 5)
     elif s.get("cost_pct_est") is not None:
         total_cost_pct = float(s.get("cost_pct_est"))
     else:
         total_cost_pct = roundtrip_cost_pct(s.get("tf", "4H"))
     cost_r = total_cost_pct / max(risk_pct, 1e-9)
-    if cost_r > MAX_COST_R:
+    # Legacy motorunun eski davranışı korunur; Grup 0-7 motorunda maliyet sinyal eleme kapısı değildir.
+    if not is_group_v3 and cost_r > MAX_COST_R:
         return None
     s["entry"] = rp(px)
     s["sl_orig"] = s["sl"]
@@ -2528,8 +2665,8 @@ def reanchor_signal(sig, px):
         try:
             room_price = float(room_price)
             s["room_r"] = round(((room_price - px) if is_long else (px - room_price)) / risk_new, 2)
-            s["pot_pct"] = round(min(abs(room_price - px) / max(px, 1e-12) * 100.0,
-                                     abs(float(s["tp3"]) - px) / max(px, 1e-12) * 100.0), 2)
+            s["pot_pct"] = round(min(abs(room_price - px) / max(float(px), 1e-12) * 100.0,
+                                     abs(float(s["tp3"]) - px) / max(float(px), 1e-12) * 100.0), 2)
             if s["room_r"] <= 0:
                 return None
         except (TypeError, ValueError, ZeroDivisionError):
@@ -2540,10 +2677,10 @@ def reanchor_signal(sig, px):
     groups_now = set(s.get("grp_matched") or [])
     if room_r_now is None:
         return None
-    if any(g in groups_now for g in ("B", "D", "F")):
-        if room_r_now < G_MIN_ROOM_R or (s.get("pot_pct") is None or s["pot_pct"] < G_MIN_POT_PCT):
-            return None
-    elif room_r_now < G_BASE_ROOM_R:
+    strict_room = bool(groups_now & {"2", "3"})
+    min_room = G_MIN_ROOM_R if strict_room else G_BASE_ROOM_R
+    min_pot = G_MIN_POT_PCT if strict_room else G_BASE_POT_PCT
+    if room_r_now < min_room or s.get("pot_pct") is None or s["pot_pct"] < min_pot:
         return None
     now_local = datetime.now()
     s["time"] = now_local.strftime("%H:%M:%S")
@@ -2551,10 +2688,6 @@ def reanchor_signal(sig, px):
     s["created_ts_ms"] = now_ms()
     return s
 
-
-# =====================================================================
-#  ISLEM YONETIMI (TP1 %50 + BE STOP + KADEMELI CIKIS)
-# =====================================================================
 def _risk_abs(h):
     """Islemin ORIJINAL risk mesafesi (fiyat cinsinden). Stop BE'ye cekilse bile degismez."""
     try:
@@ -2795,7 +2928,8 @@ def catchup_pending_unlocked():
 # =====================================================================
 def compute_learning_profile(history):
     concept_stats = {}
-    group_stats = {k: {"win": 0, "loss": 0, "net_r": 0.0} for k in GROUP_CODES}
+    group_stats = {k: {"win": 0, "loss": 0, "net_r": 0.0} for k in GROUP_SIGNAL_CODES}
+    layer_stats = {k: {"activations": 0, "win": 0, "loss": 0, "net_r": 0.0} for k in GROUP_LAYER_CODES}
     combo_stats = {}
     symbol_stats = {}
     tf_stats = {}
@@ -2822,13 +2956,19 @@ def compute_learning_profile(history):
                 st["loss"] += 1
             st["net_r"] = round(st["net_r"] + float(t.get("pnl_r", 0.0)), 2)
 
-        abcd_map = (t.get("abcd_groups") or {}) if t.get("grp_ver") == 2 else {}
-        for g_code in GROUP_CODES:
+        abcd_map = (t.get("abcd_groups") or {}) if t.get("grp_ver") == 3 else {}
+        for g_code in GROUP_SIGNAL_CODES:
             if abcd_map.get(g_code):
                 gs = group_stats[g_code]
                 gs["win" if won else "loss"] += 1
                 gs["net_r"] = round(gs["net_r"] + float(t.get("pnl_r", 0.0)), 2)
-        combo = t.get("abcd_code") if t.get("grp_ver") == 2 else None
+        for layer_code in GROUP_LAYER_CODES:
+            if abcd_map.get(layer_code):
+                ls = layer_stats[layer_code]
+                ls["activations"] += 1
+                ls["win" if won else "loss"] += 1
+                ls["net_r"] = round(ls["net_r"] + float(t.get("pnl_r", 0.0)), 2)
+        combo = t.get("abcd_code") if t.get("grp_ver") == 3 else None
         if combo:
             cb = combo_stats.setdefault(combo, {"win": 0, "loss": 0, "net_r": 0.0})
             cb["win" if won else "loss"] += 1
@@ -2886,11 +3026,20 @@ def compute_learning_profile(history):
         return out
 
     groups_table = []
-    for g_code in GROUP_CODES:
+    for g_code in GROUP_SIGNAL_CODES:
         gs = group_stats[g_code]
         tot = gs["win"] + gs["loss"]
         groups_table.append({"code": g_code, "name": GROUP_LABELS[g_code], "win": gs["win"], "loss": gs["loss"],
                              "wr": round(gs["win"] / tot * 100.0, 1) if tot else 0.0, "net_r": gs["net_r"]})
+    confluence_table = []
+    for layer_code in GROUP_LAYER_CODES:
+        ls = layer_stats[layer_code]
+        n_layer = ls["win"] + ls["loss"]
+        confluence_table.append({"code": layer_code, "name": GROUP_LABELS[layer_code],
+                                 "activations": ls["activations"], "win": ls["win"], "loss": ls["loss"],
+                                 "wr": round(ls["win"] / n_layer * 100.0, 1) if n_layer else 0.0,
+                                 "net_r": ls["net_r"],
+                                 "note": "Yalnızca bu katmanın eşlik ettiği ana grup işlemleridir; bağımsız strateji sonucu değildir."})
     combos_table = []
     for code, cb in combo_stats.items():
         tot = cb["win"] + cb["loss"]
@@ -2902,6 +3051,7 @@ def compute_learning_profile(history):
         "min_score": min_score,
         "concept_mults": concept_mults,
         "groups_table": groups_table,
+        "confluence_table": confluence_table,
         "combos_table": combos_table,
         "concepts_table": sorted(
             [{"name": k, **v, "wr": round(v["win"] / max(1, v["win"] + v["loss"]) * 100.0, 1)} for k, v in concept_stats.items()],
@@ -2917,81 +3067,113 @@ def compute_learning_profile(history):
     }
 
 
+def _bootstrap_confidence_intervals(values, samples=CI_BOOTSTRAP_SAMPLES):
+    """Dairesel moving-block bootstrap; kisa zaman bagimliligini IID'den daha iyi korur."""
+    vals = [float(x) for x in values]
+    n = len(vals)
+    if n < 2:
+        return None
+    rng = random.Random(20261126 + n)
+    block = min(5, max(2, int(round(n ** 0.5))))
+    net_samples, exp_samples = [], []
+    for _ in range(max(100, int(samples))):
+        draw = []
+        while len(draw) < n:
+            start = rng.randrange(n)
+            for j in range(block):
+                draw.append(vals[(start + j) % n])
+                if len(draw) >= n:
+                    break
+        total = sum(draw)
+        net_samples.append(total)
+        exp_samples.append(total / n)
+    net_samples.sort()
+    exp_samples.sort()
+    lo = int(0.025 * (len(net_samples) - 1))
+    hi = int(0.975 * (len(net_samples) - 1))
+    return {"net_r_95": [round(net_samples[lo], 2), round(net_samples[hi], 2)],
+            "expectancy_r_95": [round(exp_samples[lo], 3), round(exp_samples[hi], 3)],
+            "method": f"Dairesel moving-block bootstrap (blok={block}); parite korelasyonu/eşzamanlı portföy riski modellenmez"}
+
 def _calc_metrics_from_trades(trades):
     if not trades:
-        return {
-            "trades": 0, "win_rate": 0.0, "profit_factor": 0.0,
-            "max_drawdown_r": 0.0, "expectancy_r": 0.0, "avg_rr": 0.0,
-            "net_r": 0.0, "sl_rate": None, "tp1_rate": None, "tp2_rate": None,
-            "tp3_rate": None, "be_rate": None, "timeout_rate": None, "avg_cost_r": 0.0,
-        }
-    wins = [t["net_r"] for t in trades if t["net_r"] > 0]
-    losses = [t["net_r"] for t in trades if t["net_r"] <= 0]
-    gross_win = sum(wins)
-    gross_loss = abs(sum(losses))
-
-    eq = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for t in trades:
-        eq += t["net_r"]
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > max_dd:
-            max_dd = dd
-
+        return {"trades": 0, "win_rate": 0.0, "profit_factor": 0.0,
+                "max_drawdown_r": 0.0, "expectancy_r": 0.0, "avg_rr": 0.0,
+                "net_r": 0.0, "sl_rate": None, "tp1_rate": None, "tp2_rate": None,
+                "tp3_rate": None, "be_rate": None, "timeout_rate": None, "avg_cost_r": 0.0,
+                "ci95": None, "sample_warning": "ÖRNEKLEM YOK"}
+    ordered = sorted(trades, key=lambda t: int(t.get("ts", 0) or 0))
+    vals = [float(t.get("net_r", 0.0)) for t in ordered]
+    wins, losses = [x for x in vals if x > 0], [x for x in vals if x <= 0]
+    gross_win, gross_loss = sum(wins), abs(sum(losses))
+    eq = peak = max_dd = 0.0
+    for value in vals:
+        eq += value
+        peak = max(peak, eq)
+        max_dd = max(max_dd, peak - eq)
     avg_win = gross_win / len(wins) if wins else 0.0
     avg_loss = gross_loss / len(losses) if losses else 0.0
-    payoff = (avg_win / avg_loss) if avg_loss > 0 else avg_win
-    expectancy = sum(t["net_r"] for t in trades) / len(trades)
-    pf = (gross_win / gross_loss) if gross_loss > 0 else (9.99 if gross_win > 0 else 0.0)
-
+    payoff = avg_win / avg_loss if avg_loss > 0 else avg_win
+    pf = gross_win / gross_loss if gross_loss > 0 else (99.0 if gross_win > 0 else 0.0)
+    n = len(vals)
     return {
-        "trades": len(trades),
-        "win_rate": round(len(wins) / len(trades) * 100.0, 1),
-        "profit_factor": round(min(pf, 99.0), 2),
-        "max_drawdown_r": round(max_dd, 2),
-        "expectancy_r": round(expectancy, 3),
-        "avg_rr": round(payoff, 2),
-        "net_r": round(sum(t["net_r"] for t in trades), 2),
-        "sl_rate": round(sum(1 for t in trades if t.get("exit") == "SL") / len(trades) * 100.0, 1),
-        "tp1_rate": round(sum(1 for t in trades if int(t.get("stage_at_exit", 0)) >= 1) / len(trades) * 100.0, 1),
-        "tp2_rate": round(sum(1 for t in trades if int(t.get("stage_at_exit", 0)) >= 2) / len(trades) * 100.0, 1),
-        "tp3_rate": round(sum(1 for t in trades if t.get("exit") == "TP3") / len(trades) * 100.0, 1),
-        "be_rate": round(sum(1 for t in trades if t.get("exit") == "BE") / len(trades) * 100.0, 1),
-        "timeout_rate": round(sum(1 for t in trades if t.get("exit") == "TIMEOUT") / len(trades) * 100.0, 1),
-        "avg_cost_r": round(sum(float(t.get("cost_r", 0.0)) for t in trades) / len(trades), 3),
+        "trades": n, "win_rate": round(len(wins) / n * 100.0, 1),
+        "profit_factor": round(min(pf, 99.0), 2), "max_drawdown_r": round(max_dd, 2),
+        "expectancy_r": round(sum(vals) / n, 3), "avg_rr": round(payoff, 2),
+        "net_r": round(sum(vals), 2),
+        "sl_rate": round(sum(1 for t in ordered if t.get("exit") == "SL") / n * 100.0, 1),
+        "tp1_rate": round(sum(1 for t in ordered if int(t.get("stage_at_exit", 0)) >= 1) / n * 100.0, 1),
+        "tp2_rate": round(sum(1 for t in ordered if int(t.get("stage_at_exit", 0)) >= 2) / n * 100.0, 1),
+        "tp3_rate": round(sum(1 for t in ordered if t.get("exit") == "TP3") / n * 100.0, 1),
+        "be_rate": round(sum(1 for t in ordered if t.get("exit") == "BE") / n * 100.0, 1),
+        "timeout_rate": round(sum(1 for t in ordered if t.get("exit") == "TIMEOUT") / n * 100.0, 1),
+        "avg_cost_r": round(sum(float(t.get("cost_r", 0.0)) for t in ordered) / n, 3),
+        "ci95": _bootstrap_confidence_intervals(vals),
+        "sample_warning": None if n >= CI_MIN_SAMPLE else f"ÖRNEKLEM AZ: {n}/{CI_MIN_SAMPLE} işlem; CI geniş ve kararsız olabilir.",
     }
 
-
-# =====================================================================
-#  BACKTEST
-# =====================================================================
 def _bt_fetch(meta, tf):
+    """Backtest icin genis tarihsel veri; HTF/BTC mumlari ana pencereyle ayni zamani kapsar."""
     ctx = CONTEXT_TFS[tf]
     sym_id = meta["id"]
     btc_id = "BTC-USDT-SWAP"
+    primary_target = int(BACKTEST_CANDLES_BY_TF.get(tf, 4200))
     try:
-        prim = get_okx_history(sym_id, tf, 1000)
-        ctx_data = {t: get_okx_history(sym_id, t, 800) for t in ctx}
-        btc = get_okx_history(btc_id, BTC_REF_TF[tf], 1000) if sym_id != btc_id else None
+        prim = [c for c in get_okx_history(sym_id, tf, primary_target) if c["closed"]]
+        if len(prim) < 200:
+            return {"error": f"Yeterli geçmiş mum yok: {len(prim)}"}
+        primary_span_sec = len(prim) * TF_SEC[tf]
+        ctx_data = {}
+        for t in ctx:
+            target = min(5000, max(200, int(primary_span_sec / TF_SEC[t]) + 200))
+            ctx_data[t] = [c for c in get_okx_history(sym_id, t, target) if c["closed"]]
+        btc_tf = BTC_REF_TF[tf]
+        btc_target = min(5000, max(200, int(primary_span_sec / TF_SEC[btc_tf]) + 200))
+        if sym_id != btc_id:
+            cache_key = (btc_tf, btc_target)
+            with BTC_HISTORY_LOCK:
+                cached_btc = BTC_HISTORY_CACHE.get(cache_key)
+                if cached_btc is None:
+                    cached_btc = [c for c in get_okx_history(btc_id, btc_tf, btc_target) if c["closed"]]
+                    BTC_HISTORY_CACHE[cache_key] = cached_btc
+                btc = [dict(c) for c in cached_btc]
+        else:
+            btc = None
     except Exception as e:
         log.warning("Backtest veri alinamadi (%s %s): %s", sym_id, tf, e)
         return {"error": f"Geçmiş veri alınamadı: {e}"}
 
-    prim = [c for c in prim if c["closed"]]
-    if len(prim) < 200:
-        return {"error": "Yeterli geçmiş mum yok"}
     btc_tf_ms = TF_SEC[BTC_REF_TF[tf]] * 1000
     return {
-        "prim": prim,
-        "ctx_data": ctx_data,
-        "btc": btc,
+        "prim": prim, "ctx_data": ctx_data, "btc": btc,
         "ends": {t: [c["ts"] + TF_SEC[t] * 1000 for c in lst] for t, lst in ctx_data.items()},
         "btc_ends": [c["ts"] + btc_tf_ms for c in btc] if btc else [],
+        "coverage": {
+            "requested_primary": primary_target, "received_primary": len(prim),
+            "first_ts": int(prim[0]["ts"]) if prim else None,
+            "last_ts": int(prim[-1]["ts"]) if prim else None,
+        },
     }
-
 
 def _bt_apply_next_open_fill(sig, prim, signal_idx, tf):
     """Sinyal kapanışından sonra ilk yürütülebilir fiyat: sonraki mum açılışı + aleyhe kayma."""
@@ -3005,7 +3187,9 @@ def _bt_apply_next_open_fill(sig, prim, signal_idx, tf):
     slip = BACKTEST_SLIPPAGE_PCT / 100.0
     fill_px = raw_open * (1.0 + slip if side == "LONG" else 1.0 - slip)
     atr_v = float(sig.get("atr_value") or 0.0)
-    if atr_v > 0 and abs(fill_px - float(sig["entry"])) > MAX_CHASE_ATR * atr_v:
+    is_group_signal = int(sig.get("grp_ver", 0) or 0) >= 3
+    chase_limit = MAX_CHASE_ATR if is_group_signal else LEGACY_MAX_CHASE_ATR
+    if atr_v > 0 and abs(fill_px - float(sig["entry"])) > chase_limit * atr_v:
         return None
     blocked_flags = set(sig.get("blocked_by") or [])
     counterfactual = bool(sig.get("shadow_only") or "ALAN(ROOM)" in blocked_flags)
@@ -3058,21 +3242,32 @@ def _bt_outcome(h, prim, i, tf="4H"):
     return i + exp_n
 
 
-def _bt_simulate(meta, tf, data, mode, collect_blocked=False):
-    """Ayni veri uzerinde secilen modla walk-forward simulasyon."""
+def _bt_simulate(meta, tf, data, mode, collect_blocked=False, param_overrides=None):
+    """Ayni veride simülasyon; OOS giriş mumuna göre etiketlenir ve sınırı aşan eğitim işlemleri purge edilir."""
     prim = data["prim"]
     ctx = CONTEXT_TFS[tf]
     ctx_data, ends = data["ctx_data"], data["ends"]
     btc, btc_ends = data["btc"], data["btc_ends"]
     tf_ms = TF_SEC[tf] * 1000
     btc_tf_ms = TF_SEC[BTC_REF_TF[tf]] * 1000
-    learn_stub = {"concept_mults": {}, "min_score": MIN_SCORE}
+    learn_stub = {"concept_mults": {}, "min_score": (MIN_SCORE if mode == "groups" else LEGACY_MIN_SCORE),
+                  "_param_overrides": dict(param_overrides or {})}
     cool = cooldown_candles(tf, mode)
+    training_only = bool((param_overrides or {}).get("_training_only"))
+    train_end_idx = len(prim) if training_only else int(len(prim) * 0.60)
+    validation_end_idx = len(prim) if training_only else int(len(prim) * 0.80)
+    oos_start_idx = validation_end_idx
 
     trades, blocked, last_blk = [], [], {}
-    i = 100
+    i = 205 if mode == "groups" else 100
     while i < len(prim) - 2:
+        entry_idx = i + 1  # sinyal kapanışından sonraki ilk yürütülebilir mum
         close_ts = prim[i]["ts"] + tf_ms
+        progress_ratio = entry_idx / max(1, len(prim) - 1)
+        wf_fold = int(min(3, max(0, (progress_ratio - 0.40) / 0.10))) if (not training_only and 0.40 <= progress_ratio < 0.80) else None
+        segment = "train" if entry_idx < train_end_idx else ("validation" if entry_idx < validation_end_idx else "oos")
+        is_oos = (not training_only) and segment == "oos"
+        is_validation = (not training_only) and segment == "validation"
         window = prim[max(0, i - CANDLE_LIMIT + 1): i + 1]
         cmap = {tf: window}
         for t in ctx:
@@ -3085,6 +3280,7 @@ def _bt_simulate(meta, tf, data, mode, collect_blocked=False):
         diag = [] if collect_blocked else None
         sig = evaluate_signal_for_tf(meta, tf, cmap, window[-1]["close"], btc_bias, learn_stub,
                                      news=(False, "Backtest"), mode=mode, diag=diag)
+
         if diag:
             for ev in diag:
                 if ev["stage"] != "setup" or not ev.get("cand"):
@@ -3100,16 +3296,25 @@ def _bt_simulate(meta, tf, data, mode, collect_blocked=False):
                 end_shadow = _bt_outcome(hb, prim, i, tf=tf)
                 if end_shadow is None:
                     continue
+                shadow_segment = "train" if entry_idx < train_end_idx else ("validation" if entry_idx < validation_end_idx else "oos")
+                shadow_oos = (not training_only) and shadow_segment == "oos"
+                # İşlem bir dönem sınırını aşarsa iki dönemi de kirletmemek için rapordan çıkar.
+                if not training_only and ((shadow_segment == "train" and end_shadow >= train_end_idx)
+                                          or (shadow_segment == "validation" and end_shadow >= validation_end_idx)):
+                    last_blk[gk] = end_shadow
+                    continue
                 blocked.append({
                     "net_r": hb["pnl_r"], "cost_r": hb.get("cost_r", 0.2), "exit": hb.get("exit_reason"),
                     "stage_at_exit": int(hb.get("stage", 0)),
-                    "entry_ts": int(prim[i + 1]["ts"]), "ts": int(prim[end_shadow]["ts"]),
-                    "side": hb.get("side"), "regime": hb.get("regime"),
+                    "entry_ts": int(prim[entry_idx]["ts"]), "ts": int(prim[end_shadow]["ts"]),
+                    "side": hb.get("side"), "regime": hb.get("regime"), "pair": meta.get("pair"),
+                    "oos": shadow_oos, "segment": shadow_segment, "wf_fold": wf_fold,
                     "relax": list(hb.get("relaxed") or []),
                     "blocks": list(ev.get("blocks") or []),
                     "key": ev["blocks"][0] if len(ev["blocks"]) == 1 else "ÇOKLU",
                     "combo_key": "+".join(sorted(ev.get("blocks") or [])) or "Bilinmiyor",
                 })
+
         if not sig:
             i += 1
             continue
@@ -3121,32 +3326,45 @@ def _bt_simulate(meta, tf, data, mode, collect_blocked=False):
         end_j = _bt_outcome(h, prim, i, tf=tf)
         if end_j is None:
             break
+        # Purge: eğitim/validation işlemi kendi döneminin sonrasına taşıyorsa iki döneme de yazılmaz.
+        if not training_only and ((segment == "train" and end_j >= train_end_idx)
+                                  or (segment == "validation" and end_j >= validation_end_idx)):
+            i = max(end_j + 1, i + cool)
+            continue
+        matched = list(h.get("grp_matched") or [])
         trades.append({
             "net_r": h["pnl_r"], "cost_r": h.get("cost_r", 0.2), "exit": h.get("exit_reason"),
             "stage_at_exit": int(h.get("stage", 0)),
-            "entry_ts": int(prim[i + 1]["ts"]), "ts": int(prim[end_j]["ts"]),
-            "side": h.get("side"), "regime": h.get("regime"),
+            "entry_ts": int(prim[entry_idx]["ts"]), "ts": int(prim[end_j]["ts"]),
+            "side": h.get("side"), "regime": h.get("regime"), "pair": meta.get("pair"),
+            "oos": is_oos, "segment": segment, "wf_fold": wf_fold,
             "relax": list(h.get("relaxed") or []),
-            "groups": list(h.get("grp_matched") or []),
+            "groups": [g for g in matched if g in GROUP_SIGNAL_CODES],
+            "confluence_layers": [g for g in matched if g in GROUP_LAYER_CODES],
         })
         i = max(end_j + 1, i + cool)
     return trades, blocked
 
-
 def _metrics_pack(trades):
-    ordered = sorted(trades, key=lambda t: int(t.get("ts", 0)))
-    stamps = [int(t.get("ts", 0)) for t in ordered if t.get("ts") is not None]
-    if len(ordered) >= 2 and stamps and max(stamps) > min(stamps):
-        cutoff = min(stamps) + int((max(stamps) - min(stamps)) * 0.70)
-        train = [t for t in ordered if int(t.get("ts", 0)) < cutoff]
-        test = [t for t in ordered if int(t.get("ts", 0)) >= cutoff]
+    ordered = sorted(trades, key=lambda t: int(t.get("ts", 0) or 0))
+    overall = _calc_metrics_from_trades(ordered)
+    if ordered and all(t.get("segment") in ("train", "validation", "oos") for t in ordered):
+        train = [t for t in ordered if t.get("segment") == "train"]
+        validation = [t for t in ordered if t.get("segment") == "validation"]
+        test = [t for t in ordered if t.get("segment") == "oos"]
+        split_method = ("Bar bazlı kronolojik %60 eğitim / %20 doğrulama / %20 kilitli OOS. "
+                        "Eğitim ve doğrulama sınırlarını aşan işlemler purge edilir.")
     else:
-        train, test = ordered, []
-    return {"overall": _calc_metrics_from_trades(ordered),
+        train = [t for t in ordered if not t.get("oos")]
+        validation = []
+        test = [t for t in ordered if t.get("oos")]
+        split_method = "Eski kayıt uyumluluğu: oos etiketli işlemler ayrıldı; doğrulama segmenti mevcut değil."
+    return {"overall": overall,
             "in_sample": _calc_metrics_from_trades(train),
+            "validation": _calc_metrics_from_trades(validation),
             "out_of_sample": _calc_metrics_from_trades(test),
-            "oos_cutoff_ts": cutoff if len(ordered) >= 2 and stamps and max(stamps) > min(stamps) else None}
-
+            "split_method": split_method,
+            "train_trades": len(train), "validation_trades": len(validation), "oos_trades": len(test)}
 
 def _group_metrics(trades, keyf):
     groups = {}
@@ -3164,6 +3382,7 @@ def _bt_pack(meta, tf, data, leg, v3, blocked):
         "legacy": _metrics_pack(leg),
         "v3": {**_metrics_pack(v3), "relax": _group_metrics(v3, lambda t: t["relax"] or ["Esnetme yok"]),
                "groups": _group_metrics(v3, lambda t: t.get("groups") or ["Grupsuz"]),
+               "confluence": _group_metrics(v3, lambda t: t.get("confluence_layers") or []),
                "sides": _group_metrics(v3, lambda t: [t.get("side") or "Bilinmiyor"]),
                "regimes": _group_metrics(v3, lambda t: [t.get("regime") or "Bilinmiyor"])},
         "blocked": _group_metrics(blocked, lambda t: [t["key"]]),
@@ -3173,48 +3392,93 @@ def _bt_pack(meta, tf, data, leg, v3, blocked):
         "walk_forward_method": "Kronolojik zaman dilimleri; sabit kural seti (adaptif model eğitimi değildir)",
     }
     wf = []
-    if len(v3) >= 6:
-        ordered_v3 = sorted(v3, key=lambda t: int(t.get("ts", 0)))
-        stamps = [int(t.get("ts", 0)) for t in ordered_v3]
-        t0, t1 = min(stamps), max(stamps)
-        if t1 > t0:
-            for w in range(3):
-                lo = t0 + int((t1 - t0) * w / 3.0)
-                hi = t0 + int((t1 - t0) * (w + 1) / 3.0) if w < 2 else t1 + 1
-                chunk = [t for t in ordered_v3 if lo <= int(t.get("ts", 0)) < hi]
-                if chunk:
-                    wf.append({"window": f"WF-{w + 1}", **_calc_metrics_from_trades(chunk)})
+    for fold, m in sorted(_group_metrics(v3, lambda t: [str(t.get("wf_fold"))] if t.get("wf_fold") is not None else {}).items()):
+        wf.append({"window": f"WF-{int(fold) + 1}", **m})
     out["overall"] = out["v3"]["overall"]
     out["out_of_sample"] = out["v3"]["out_of_sample"]
     out["walk_forward"] = wf
+    out["walk_forward_method"] = (
+        "4 kronolojik ileri pencere (ana mumların %40-%80 bölümü); her pencerede aynı sabit kurallar. "
+        "Parametre optimizasyonu yapılmadığından bu, yeniden-eğitim yapan adaptif WF değildir."
+    )
+    out["oos_protocol"] = out["v3"].get("split_method")
+    out["blocked_combinations"] = _group_metrics(blocked, lambda t: [t.get("combo_key", "Bilinmiyor")] if len(t.get("blocks") or []) > 1 else [])
+    out["blocked_single_filter_only"] = _group_metrics(blocked, lambda t: [t.get("combo_key", "Bilinmiyor")] if len(t.get("blocks") or []) == 1 else [])
     return out
 
+def _run_parameter_sensitivity(meta, tf, data, baseline_trades=None):
+    """Parametre duyarlılığı yalnızca ilk %60 eğitim verisinde; %20 validation ve %20 OOS kilitlidir."""
+    split = max(220, int(len(data["prim"]) * 0.60))
+    train_data = dict(data)
+    train_data["prim"] = data["prim"][:split]
+    train_data["coverage"] = {**(data.get("coverage") or {}), "sensitivity_bars": split}
+    scenarios = [
+        ("MIN_STOP_ATR 1.00", {"min_stop_atr": 1.00}),
+        ("MIN_STOP_ATR 1.20", {"min_stop_atr": 1.20}),
+        ("MIN_STOP_ATR 1.50", {"min_stop_atr": 1.50}),
+        ("STOP_BUFFER_ATR 0.45", {"stop_buffer_atr": 0.45}),
+        ("STOP_BUFFER_ATR 0.50", {"stop_buffer_atr": 0.50}),
+        ("MIN_SCORE 76", {"min_score": 76}),
+        ("MIN_SCORE 80", {"min_score": 80}),
+        ("G3 breakout RVOL 1.00", {"g3_min_rvol": 1.00}),
+        ("G3 breakout RVOL 1.20", {"g3_min_rvol": 1.20}),
+        ("G3 breakout RVOL 1.35", {"g3_min_rvol": 1.35}),
+        ("G4 sweep RVOL 1.40", {"g4_min_rvol": 1.40}),
+        ("G4 sweep RVOL 1.60", {"g4_min_rvol": 1.60}),
+        ("G4 sweep RVOL 1.80", {"g4_min_rvol": 1.80}),
+        ("G5 EQ sweep RVOL 0.75", {"g5_min_rvol": 0.75}),
+        ("G5 EQ sweep RVOL 0.90", {"g5_min_rvol": 0.90}),
+        ("G5 EQ sweep RVOL 1.05", {"g5_min_rvol": 1.05}),
+        ("ROOM base 1.30R", {"base_room_r": 1.30, "base_pot_pct": 1.80}),
+        ("ROOM strict 1.85R", {"min_room_r": 1.85, "min_pot_pct": 2.35}),
+    ]
+    rows = []
+    base_train, _ = _bt_simulate(meta, tf, train_data, "groups", collect_blocked=False,
+                                  param_overrides={"_training_only": True})
+    rows.append({"name": "Mevcut V5.1 ayarı (eğitim)", "trades": len(base_train),
+                 "overall": _calc_metrics_from_trades(base_train), "oos": None, "scope": "Yalnızca ilk %60 eğitim"})
+    for name, overrides in scenarios:
+        merged = {"_training_only": True, **overrides}
+        trades, _ = _bt_simulate(meta, tf, train_data, "groups", collect_blocked=False, param_overrides=merged)
+        rows.append({"name": name, "trades": len(trades), "overall": _calc_metrics_from_trades(trades),
+                     "oos": None, "scope": "Yalnızca ilk %60 eğitim"})
+    return {"scenarios": rows, "training_bars": split, "locked_validation": True, "locked_oos": True,
+            "warning": "Parametre duyarlılığı yalnızca ilk %60 eğitim verisinde çalışır. Sonraki %20 doğrulama, son %20 OOS parametre seçimi için kullanılmaz; değişiklikler otomatik uygulanmaz.",
+            "tested_parameters": ["MIN_STOP_ATR", "STOP_BUFFER_ATR", "MIN_SCORE", "G3 RVOL", "G4 RVOL", "G5 RVOL", "ROOM"]}
 
 def run_walk_forward_backtest(meta, tf):
-    """Tek parite: ESKI (legacy) ve YENI (v3) sistemi ayni veride karsilastirir."""
+    """Tek parite: genis tarih, ayri kronolojik OOS, sabit-parametre WF ve duyarlilik raporu."""
+    with BTC_HISTORY_LOCK:
+        BTC_HISTORY_CACHE.clear()
     data = _bt_fetch(meta, tf)
     if "error" in data:
         return data
     leg, _ = _bt_simulate(meta, tf, data, "legacy")
     v3, blocked = _bt_simulate(meta, tf, data, "groups", collect_blocked=True)
-    return _bt_pack(meta, tf, data, leg, v3, blocked)
+    out = _bt_pack(meta, tf, data, leg, v3, blocked)
+    out["coverage"] = data.get("coverage")
+    out["sensitivity"] = _run_parameter_sensitivity(meta, tf, data, v3)
+    return out
 
-
-def run_backtest_multi(tf, n):
-    """Birden cok parite: eski/yeni sistem + engellenen kurulumlarin sanal sonuclari, toplu."""
+def run_backtest_multi(tf, n=None):
+    """Tüm keşfedilmiş aktif SWAP sözleşmelerinde eski/yeni sistem A/B backtesti."""
+    with BTC_HISTORY_LOCK:
+        BTC_HISTORY_CACHE.clear()
+    fresh_pairs, _ = discover_live_swap_pairs()
+    pairs = sorted(set(fresh_pairs))
+    if not pairs:
+        with LOCK:
+            STATE["backtest_multi"] = {
+                "running": False, "done": 0, "total": 0, "tf": tf, "result": None,
+                "error": "Güncel ve geçerli LAST fiyatı bulunan aktif SWAP sözleşmesi keşfedilemedi.",
+                "discovery": dict(LAST_DISCOVERY_STATS),
+            }
+        return
     with LOCK:
-        pairs = list(STATE.get("crypto_pairs") or FALLBACK_CRYPTO_PAIRS)
-        STATE["backtest_multi"] = {"running": True, "done": 0, "total": 0, "tf": tf, "result": None}
-    chosen = []
-    if "BTC-USDT-SWAP" in pairs:
-        chosen.append("BTC-USDT-SWAP")
-    for p in pairs:
-        if len(chosen) >= n:
-            break
-        if p not in chosen:
-            chosen.append(p)
+        STATE["crypto_pairs"] = list(pairs)
+    chosen = pairs if n is None or int(n) <= 0 else pairs[:int(n)]
     with LOCK:
-        STATE["backtest_multi"]["total"] = len(chosen)
+        STATE["backtest_multi"] = {"running": True, "done": 0, "total": len(chosen), "tf": tf, "result": None}
 
     def work(sym):
         meta = {"id": sym, "pair": swap_to_pair(sym)}
@@ -3226,13 +3490,15 @@ def run_backtest_multi(tf, n):
             v3, blk = _bt_simulate(meta, tf, data, "groups", collect_blocked=True)
             return sym, (leg, v3, blk)
         except Exception as e:
-            log.warning("Multi backtest parite hatasi (%s): %s", sym, e)
+            log.warning("Multi backtest parite hatası (%s): %s", sym, e)
             return sym, None
 
-    all_leg, all_v3, all_blk, rows, done = [], [], [], [], 0
+    all_leg, all_v3, all_blk, rows, done, failed = [], [], [], [], 0, 0
     try:
+        # Concurrency deliberately modest to respect OKX public REST rate limits.
         with ThreadPoolExecutor(max_workers=3) as pool:
-            for fut in as_completed([pool.submit(work, s) for s in chosen]):
+            futures = [pool.submit(work, sym) for sym in chosen]
+            for fut in as_completed(futures):
                 sym, res = fut.result()
                 done += 1
                 if res:
@@ -3240,39 +3506,49 @@ def run_backtest_multi(tf, n):
                     all_leg += leg
                     all_v3 += v3
                     all_blk += blk
-                    rows.append({
-                        "pair": swap_to_pair(sym),
-                        "legacy_n": len(leg), "v3_n": len(v3),
-                        "legacy_net": round(sum(t["net_r"] for t in leg), 2),
-                        "v3_net": round(sum(t["net_r"] for t in v3), 2),
-                    })
+                    rows.append({"pair": swap_to_pair(sym), "legacy_n": len(leg), "v3_n": len(v3),
+                                 "legacy_net": round(sum(t["net_r"] for t in leg), 2),
+                                 "v3_net": round(sum(t["net_r"] for t in v3), 2)})
+                else:
+                    failed += 1
                 with LOCK:
                     STATE["backtest_multi"]["done"] = done
         for lst in (all_leg, all_v3, all_blk):
             lst.sort(key=lambda t: t["ts"])
         rows.sort(key=lambda r: -r["v3_net"])
         result = {
-            "tf": tf, "pairs": len(rows),
+            "tf": tf, "pairs": len(rows), "requested_pairs": len(chosen), "failed_pairs": failed,
             "legacy": _metrics_pack(all_leg),
-            "v3": {**_metrics_pack(all_v3), "relax": _group_metrics(all_v3, lambda t: t["relax"] or ["Esnetme yok"]),
-               "groups": _group_metrics(all_v3, lambda t: t.get("groups") or ["Grupsuz"])},
+            "v3": {**_metrics_pack(all_v3),
+                   "relax": _group_metrics(all_v3, lambda t: t.get("relax") or ["Esnetme yok"]),
+                   "groups": _group_metrics(all_v3, lambda t: t.get("groups") or ["Grupsuz"]),
+                   "confluence": _group_metrics(all_v3, lambda t: t.get("confluence_layers") or []),
+                   "regimes": _group_metrics(all_v3, lambda t: [t.get("regime") or "Bilinmiyor"]),
+                   "sides": _group_metrics(all_v3, lambda t: [t.get("side") or "Bilinmiyor"])},
             "blocked": _group_metrics(all_blk, lambda t: [t["key"]]),
+            "blocked_combinations": _group_metrics(all_blk, lambda t: [t.get("combo_key", "Bilinmiyor")] if len(t.get("blocks") or []) > 1 else []),
+            "blocked_single_filter_only": _group_metrics(all_blk, lambda t: [t.get("combo_key", "Bilinmiyor")] if len(t.get("blocks") or []) == 1 else []),
+            "walk_forward": [
+                {"window": f"WF-{i + 1}", **_calc_metrics_from_trades([t for t in all_v3 if t.get("wf_fold") == i])}
+                for i in range(4) if any(t.get("wf_fold") == i for t in all_v3)
+            ],
+            "walk_forward_method": "4 kronolojik ileri pencere; sabit kural seti, adaptif yeniden eğitim yok.",
+            "oos_pooling_method": "Her paritenin kendi mum dizisinde %60/%20/%20 kronolojik segment; ortak takvim kesiti değildir.",
+            "portfolio_risk_note": "Havuzlanmış max-DD eşzamanlı pozisyon büyüklüğü ve pariteler arası korelasyonu tam portföy simülasyonu olarak modellemez.",
+            "coverage": {"requested_primary": BACKTEST_CANDLES_BY_TF.get(tf), "requested_pairs": len(chosen),
+                         "pairs_completed": len(rows), "pairs_failed": failed,
+                         "universe": "Keşfedilen tüm aktif SWAP sözleşmeleri (geçerli ve güncel LAST fiyatı olanlar)",
+                         "discovery": dict(LAST_DISCOVERY_STATS),
+                         "universe_complete": not bool(LAST_DISCOVERY_STATS.get("using_fallback"))},
             "per_pair": rows,
         }
         with LOCK:
             STATE["backtest_multi"] = {"running": False, "done": done, "total": len(chosen), "tf": tf, "result": result}
     except Exception as e:
-        log.exception("Multi backtest hatasi")
+        log.exception("Multi backtest hatası")
         with LOCK:
             STATE["backtest_multi"] = {"running": False, "done": done, "total": len(chosen), "tf": tf,
                                        "result": None, "error": str(e)}
-
-
-# =====================================================================
-#  ENGELLEME ANALIZI + SANAL (SHADOW) PERFORMANS
-# =====================================================================
-SEEN_DIAG = {}
-
 
 def _new_blocks_state():
     return {"since": datetime.now().strftime("%d.%m.%Y %H:%M"), "events": 0, "setups_blocked": 0,
@@ -3338,7 +3614,14 @@ def process_diag_locked(diag_all):
             f = blocks["funnel"]
             if ev["stage"] == "hard":
                 f[ev["name"]] = f.get(ev["name"], 0) + 1
+            for group_code, passed_group in (ev.get("group_status_by_group") or {}).items():
+                attempt_name = f"{group_code}:kontrol"
+                f[attempt_name] = f.get(attempt_name, 0) + 1
+                if passed_group:
+                    pass_name = f"{group_code}:kurulum_geçti"
+                    f[pass_name] = f.get(pass_name, 0) + 1
             for group_code, miss_list in (ev.get("missing_by_group") or {}).items():
+                # Sadece gerçekten başarısız olan koşullar sayılır; grubun bütün şartları topluca yazılmaz.
                 for missing_key in miss_list:
                     miss_name = f"{group_code}-eksik:{missing_key}"
                     f[miss_name] = f.get(miss_name, 0) + 1
@@ -3913,13 +4196,12 @@ def compute_btc_bias_map():
 
 def fetch_and_analyze_one(sym, chart_tf, btc_bias_map, learn_snap, open24h, want_diag=False, market_snapshot=None):
     all_needed_tfs = list(dict.fromkeys([*ALL_SCAN_TFS, chart_tf]))
-    closed_map = {}
-    all_raw_map = {}
+    closed_map, all_raw_map = {}, {}
     for tf_x in all_needed_tfs:
         try:
             cs = get_candles_cached(sym, tf_x)
         except Exception as e:
-            log.debug("Mum cekilemedi (%s %s): %s", sym, tf_x, e)
+            log.debug("Mum çekilemedi (%s %s): %s", sym, tf_x, e)
             continue
         if cs:
             all_raw_map[tf_x] = cs
@@ -3930,7 +4212,6 @@ def fetch_and_analyze_one(sym, chart_tf, btc_bias_map, learn_snap, open24h, want
     chart_all = all_raw_map.get(chart_tf) or []
     if not chart_all or not closed_map:
         return None
-
     ref_tf = chart_tf if chart_tf in all_raw_map else next(iter(all_raw_map))
     ref_all = all_raw_map[ref_tf]
     tf_ms = TF_SEC.get(ref_tf, 14400) * 1000
@@ -3939,15 +4220,14 @@ def fetch_and_analyze_one(sym, chart_tf, btc_bias_map, learn_snap, open24h, want
 
     meta = {"id": sym, "pair": swap_to_pair(sym), "provider": "OKX SWAP"}
     with LOCK:
-        # Sinyal ve giriş doğrulaması için seçili görüntü fiyatı değil, yürütülebilir LAST fiyatı kullanılır.
-        p_info = _crypto_active_price(sym, ref_all[-1]["close"])
         last_info = STATE["last_prices"].get(sym)
-        last_age_ms = (max(0, now_ms() - int(last_info.get("ts_ms", 0))) if last_info else None)
+        last_age_ms = max(0, now_ms() - int(last_info.get("ts_ms", 0))) if last_info else None
         last_fresh = bool(last_info and last_info.get("price") and last_age_ms is not None
                           and last_age_ms <= PRICE_FRESHNESS_SEC * 1000.0)
         live_px = float(last_info["price"]) if last_fresh else None
     if not last_fresh or live_px is None or live_px <= 0:
         return None
+
     if open24h and open24h > 0:
         chg = (live_px - open24h) / open24h * 100.0
     else:
@@ -3955,86 +4235,24 @@ def fetch_and_analyze_one(sym, chart_tf, btc_bias_map, learn_snap, open24h, want
         chg = ((live_px - prev_c) / prev_c * 100.0) if prev_c else 0.0
 
     diag = [] if want_diag else None
-    market_snapshot = market_snapshot or {}
-    try:
-        market_vol = float(market_snapshot.get("vol_24h_usdt") or 0.0)
-        market_spread = float(market_snapshot.get("spread_pct")) if market_snapshot.get("spread_pct") is not None else None
-        market_age = max(0, now_ms() - int(market_snapshot.get("ts_ms") or 0))
-    except (TypeError, ValueError):
-        market_vol, market_spread, market_age = 0.0, None, 10**12
-    market_eligible = (market_vol >= MIN_VOL_USDT_24H and market_spread is not None
-                       and market_spread <= MAX_SPREAD_PCT
-                       and market_age <= MAX_TICKER_AGE_SEC * 1000.0)
-    if market_eligible:
-        sig = evaluate_signal_all_tfs(meta, closed_map, live_px, btc_bias_map, learn_snap, diag=diag)
-    else:
-        sig = None
-        _note(diag, chart_tf, None, "LIKIDITE_VERISI_YOK", int((closed_map.get(chart_tf) or [{}])[-1].get("ts", 0)),
-              stage="hard", extra={"volume_24h_usdt": market_vol, "spread_pct": market_spread,
-                                    "ticker_age_ms": market_age})
+    sig = evaluate_signal_all_tfs(meta, closed_map, live_px, btc_bias_map, learn_snap, diag=diag)
     if sig:
-        info = _market_cost_info_cached(sym, live_px, sig.get("side", "LONG"), sig.get("tf", chart_tf))
-        book_spread = info.get("spread_pct")
-        ticker_spread = market_snapshot.get("spread_pct")
-        effective_spread = book_spread if book_spread is not None else ticker_spread
-        if effective_spread is not None and float(effective_spread) > MAX_SPREAD_PCT:
-            if diag is not None:
-                blocked_cand = dict(sig)
-                blocked_cand["spread_pct"] = round(float(effective_spread), 5)
-                diag.append({"tf": sig.get("tf"), "side": sig.get("side"), "name": "SPREAD",
-                             "ts": int((closed_map.get(sig.get("tf")) or [{}])[-1].get("ts", 0)),
-                             "stage": "setup", "blocks": ["SPREAD"], "cand": blocked_cand})
-            sig = None
-        else:
-            tf_sig = sig.get("tf", chart_tf)
-            hold_h = expire_candles_for_tf(tf_sig) * TF_SEC.get(tf_sig, 14400) / 3600.0 * 0.5
-            if info.get("funding_cost_pct") is None:
-                total_cost_pct = roundtrip_cost_pct(tf_sig)
-                cost_source = "SABİT KOMİSYON/SLİPAJ + TAHMİNİ FUNDING"
-            else:
-                total_cost_pct = ROUNDTRIP_COST_PCT + float(info["funding_cost_pct"])
-                cost_source = "SABİT KOMİSYON/SLİPAJ + COIN-BAZLI OKX FUNDING"
-            if effective_spread is not None:
-                total_cost_pct += float(effective_spread)
-            risk_pct = float(sig.get("risk_pct") or 0.0)
-            actual_cost_r = total_cost_pct / max(risk_pct, 1e-9)
-            sig.update({
-                "cost_r": round(actual_cost_r, 3),
-                "cost_pct_est": round(total_cost_pct, 4),
-                "cost_source": cost_source,
-                "funding_rate": info.get("funding_rate"),
-                "funding_interval_hours": info.get("funding_interval_hours"),
-                "funding_cost_pct": round(float(info["funding_cost_pct"]), 5) if info.get("funding_cost_pct") is not None else None,
-                "funding_source": info.get("funding_source"),
-                "spread_pct": round(float(effective_spread), 5) if effective_spread is not None else None,
-                "volume_24h_usdt": market_snapshot.get("vol_24h_usdt"),
-                "book_depth_usdt": round(float(info["book_depth_usdt"]), 2) if info.get("book_depth_usdt") is not None else None,
-                "book_depth_side": info.get("book_depth_side"),
-                "book_source": info.get("book_source"),
-            })
-            if actual_cost_r > MAX_COST_R:
-                if diag is not None:
-                    blocked_cand = dict(sig)
-                    diag.append({"tf": sig.get("tf"), "side": sig.get("side"), "name": "MALİYET_GERÇEK",
-                                 "ts": int((closed_map.get(sig.get("tf")) or [{}])[-1].get("ts", 0)),
-                                 "stage": "setup", "blocks": ["MALİYET_GERÇEK"], "cand": blocked_cand})
-                sig = None
-    return {
-        "id": sym,
-        "pair": meta["pair"],
-        "provider": meta["provider"],
-        "tf": chart_tf,
-        "base_price": chart_all[-1]["close"],
-        "open24h": open24h,
-        "change_pct": round(chg, 2),
-        "candles": chart_all[-160:],
-        "signal": sig,
-        "diag": diag,
-        "price_source": "LAST (OKX SWAP)",
-        "price_age_ms": last_age_ms,
-        "price_fresh": True,
-    }
+        # Maliyet yalnız raporlama/sonuç hesabı içindir; V5.1 sinyal kapısı değildir.
+        tf_sig = sig.get("tf", chart_tf)
+        sig.setdefault("cost_pct_est", roundtrip_cost_pct(tf_sig))
+        risk_pct = float(sig.get("risk_pct") or 0.0)
+        sig.setdefault("cost_r", round(roundtrip_cost_pct(tf_sig) / max(risk_pct, 1e-9), 3))
+        sig["cost_source"] = "sabit araştırma varsayımı; sinyal engeli değil"
+        sig["spread_gate"] = "DISABLED"
+        sig["volume_gate"] = "DISABLED"
 
+    return {
+        "id": sym, "pair": meta["pair"], "provider": meta["provider"],
+        "tf": chart_tf, "base_price": chart_all[-1]["close"], "open24h": open24h,
+        "change_pct": round(chg, 2), "candles": chart_all[-160:],
+        "signal": sig, "diag": diag, "price_source": "LAST (OKX SWAP)",
+        "price_age_ms": last_age_ms, "price_fresh": True,
+    }
 
 def safe_fetch_analyze(sym, tf, btc_bias_map, learn_snap, open24h, want_diag=False, market_snapshot=None):
     try:
@@ -4193,7 +4411,10 @@ def run_scan(target_tf):
                 persist_ui_state_locked()
 
             process_diag_locked(diag_all)
-            STATE["history"] = hist[:HISTORY_LIMIT]
+            active_history = [h for h in hist if h.get("status") == "BEKLIYOR"]
+            closed_history = [h for h in hist if h.get("status") != "BEKLIYOR"][:HISTORY_LIMIT]
+            STATE["history"] = sorted(active_history + closed_history,
+                                      key=lambda h: int(h.get("created_ts_ms", 0) or 0), reverse=True)
             STATE["learning"] = compute_learning_profile(STATE["history"])
             STATE["scan_ok"] = len(results)
             STATE["scan_total"] = len(live_pairs)
@@ -4322,8 +4543,6 @@ def get_snapshot():
             item["r_now"] = round(fav / risk, 2) if fav is not None and risk > 0 else None
             item["late"] = bool(cur_p is not None and int(h.get("stage", 0)) == 0 and fav >= 0.5 * risk)
             active_sigs.append(item)
-            if len(active_sigs) >= 200:
-                break
 
         wl_trades = [t for t in STATE["history"] if t.get("status") in ("WIN", "LOSS")]
         live_perf = _calc_metrics_from_trades([{"net_r": float(t.get("pnl_r", 0.0))} for t in wl_trades])
@@ -4376,14 +4595,28 @@ def get_snapshot():
             "trade_stats": trade_stats,
             "today_signals": today_cnt,
             "max_day": MAX_SIGNALS_PER_DAY,
+            "signal_quota": "YOK",
             "min_groups": 1,
-            "min_groups_policy": "A-F motorunda tek kaliteli grup yeterlidir; çoklu grup ek kalite göstergesidir.",
+            "min_groups_policy": "Grup 0 rejim/yön kapısıdır; Grup 1–5/7 sinyal motorlarıdır, Grup 6 yalnız confluence katmanıdır.",
             "abcd_legend": GROUP_LABELS,
             "learning": learn,
             "backtest": STATE.get("backtest"),
             "backtest_multi": STATE.get("backtest_multi"),
             "block_analysis": STATE.get("block_summary"),
+            "market_universe": dict(LAST_DISCOVERY_STATS),
+            "data_health": {
+                "ws_connected": bool(STATE.get("ws_connected")),
+                "ws_status": STATE.get("ws_status"),
+                "ws_reconnects": int(STATE.get("ws_reconnects", 0)),
+                "tracked_pairs": len(STATE.get("crypto_pairs") or []),
+                "stale_last_prices": sum(
+                    1 for sym in (STATE.get("crypto_pairs") or [])
+                    if not (STATE.get("last_prices", {}).get(sym)
+                            and now_ms() - int(STATE["last_prices"][sym].get("ts_ms", 0)) <= PRICE_FRESHNESS_SEC * 1000)
+                ),
+            },
             "strategy_mode": STRATEGY_MODE,
+            "strategy_version": "5.1",
         }
 
 
@@ -4392,7 +4625,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>OKX SWAP Canlı Sinyal Paneli V4.0</title>
+<title>OKX SWAP Canlı Sinyal Paneli V5.1.1</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
@@ -4559,6 +4792,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <input type="range" id="radioVol" min="0" max="100" value="30" />
       </span>
       <span class="meta" id="metaTxt">Yükleniyor...</span>
+      <span class="meta" id="dataHealth">Veri sağlığı yükleniyor...</span>
     </div>
   </div>
 
@@ -4596,7 +4830,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="card" style="margin-top:12px;">
     <div class="card-title">
       <span>Başarı Analizi, Öğrenen Motor & Walk-Forward Backtest</span>
-      <span><button class="btn" id="btBtn">Seçili Paritede Backtest Çalıştır</button> <button class="btn" id="btMultiBtn">A/B Backtest (İlk 40 Parite)</button></span>
+      <span><button class="btn" id="btBtn">Seçili Paritede Backtest Çalıştır</button> <button class="btn" id="btMultiBtn">A/B Backtest (Tüm Aktif SWAP Pariteleri)</button></span>
     </div>
 
     <div class="p3-grid">
@@ -4628,7 +4862,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div id="learnTxt" class="muted">Henüz kapanmış WIN/LOSS işlemi bekleniyor.</div>
       </div>
       <div class="sub-box">
-        <div style="font-weight:700; margin-bottom:4px;">A–F Grup, TF & Konsept Başarısı</div>
+        <div style="font-weight:700; margin-bottom:4px;">1–7 Grup, TF & Konsept Başarısı</div>
         <div id="perfBreakTxt" class="muted">Veri biriktikçe listelenir.</div>
       </div>
       <div class="sub-box">
@@ -4639,14 +4873,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div class="card" style="margin-top:12px;">
-    <div class="card-title"><span>V4.0 Engelleme Analizi & Eski/Yeni Karşılaştırma</span></div>
+    <div class="card-title"><span>V5.1 Engelleme Analizi & Eski/Yeni Karşılaştırma</span></div>
     <div class="p3-cols">
       <div class="sub-box">
         <div style="font-weight:700; margin-bottom:4px;">Canlı Engelleme Analizi (filtre/parite bazlı + sanal performans)</div>
         <div id="blockTxt" class="muted">İlk taramadan sonra dolar. Sanal sonuçlar mum kapandıkça birikir.</div>
       </div>
       <div class="sub-box">
-        <div style="font-weight:700; margin-bottom:4px;">A/B Backtest (çoklu parite, eski ICT motoru vs yeni A–F grupları)</div>
+        <div style="font-weight:700; margin-bottom:4px;">A/B Backtest (çoklu parite, eski ICT motoru vs yeni 1–7 grupları)</div>
         <div id="abTxt" class="muted">"A/B Backtest" butonuna bas (birkaç dakika sürebilir).</div>
       </div>
     </div>
@@ -5044,10 +5278,10 @@ function buildSigCard(s) {
       <div class="live-row"><span class="live-px js-cur">-</span><span class="live-r js-r">-</span></div>
       <div class="track" title="SL → GİRİŞ → TP1 → TP2 → TP3">${ticks}<b class="tk-now js-now" style="left:0%"></b></div>
       <div class="muted js-stage" style="font-size:11px;"></div>
-      <div class="muted" style="font-size:11px;">R:R ${rrl.tp1 ?? "-"}/${rrl.tp2 ?? s.rr}/${rrl.tp3 ?? "-"} · Risk %${s.risk_pct ?? "-"} · Net maliyet ~${s.cost_r ?? "-"}R</div>
+      <div class="muted" style="font-size:11px;">R:R ${rrl.tp1 ?? "-"}/${rrl.tp2 ?? s.rr}/${rrl.tp3 ?? "-"} · Stop mesafesi %${s.risk_pct ?? "-"} · Önerilen katsayı x${s.risk_multiplier ?? 1}</div>
       <div class="muted" style="font-size:10px;">${esc(expText)}</div>
       <div class="muted js-quote-meta" style="font-size:10px;">Sinyal fiyatı LAST · veri yaşı ${s.last_price_age_ms == null ? "?" : Math.round(s.last_price_age_ms / 1000) + " sn"} · ${s.last_price_fresh ? "güncel" : "bayat/bekleniyor"}</div>
-      <div class="muted" style="font-size:10px;">Spread %${s.spread_pct ?? "?"} · Funding ${s.funding_rate === null || s.funding_rate === undefined ? "tahmini" : (Number(s.funding_rate) * 100).toFixed(4) + "%"} · Defter ${s.book_depth_usdt ? "$" + Math.round(s.book_depth_usdt).toLocaleString("en-US") : "ölçülemedi"}</div>
+      <div class="muted" style="font-size:10px;">Sinyal kontrolünde spread/hacim eşiği kullanılmaz · Grup ${esc((s.grp_matched || []).join("+") || "-")}</div>
       <div class="lv-grid">
         <div class="lv-cell"><span>Giriş</span><strong>${fmt(s.entry)}</strong></div>
         <div class="lv-cell"><span class="js-sl-lbl">Stop Loss</span><strong class="js-sl">${fmt(s.sl)}</strong></div>
@@ -5097,7 +5331,7 @@ function renderSignals(sigs, minScTxt, minGrpTxt) {
     sigListKey = key;
     list.innerHTML = sigs.length
       ? sigs.map(buildSigCard).join("")
-      : `<div class="sig-card muted" style="cursor:default;">${minScTxt}+ skor; 1H/4H/1D genelinde A-F gruplarından tek bir kaliteli kurulum veya birden fazla uyumlu grup aranıyor. Bayat fiyatla sinyal üretilmez.</div>`;
+      : `<div class="sig-card muted" style="cursor:default;">${minScTxt}+ skor; 1H/4H/1D genelinde 1–7 gruplarından tek bir kaliteli kurulum veya birden fazla uyumlu grup aranıyor. Bayat fiyatla sinyal üretilmez.</div>`;
     list.scrollTop = st;
   }
   const cards = list.children;
@@ -5193,7 +5427,7 @@ function renderFaz3(d) {
   const fails = (lr.top_fail_reasons || []).map(f => `${f.reason} (${f.count})`).join(", ");
   const blk = (lr.blocked_symbols || []).join(", ");
   document.getElementById("learnTxt").innerHTML =
-    `Aktif Min Skor: <b>${lr.min_score ?? 85}</b> · Öğrenilen İşlem: <b>${lr.learned_trades ?? 0}</b><br/>` +
+    `Aktif Min Skor: <b>${lr.min_score ?? 80}</b> · Öğrenilen İşlem: <b>${lr.learned_trades ?? 0}</b><br/>` +
     `Başarısızlık Nedenleri: ${esc(fails || "Henüz kayıt yok")}` +
     (blk ? `<br/>Geçici bloklu pariteler: ${esc(blk)}` : "");
 
@@ -5202,10 +5436,13 @@ function renderFaz3(d) {
   const tfTxt = (lr.tfs_table || []).map(t => `${t.name}: ${t.wr}% (${t.net_r}R)`).join(" | ");
   const topC = (lr.concepts_table || []).slice(0, 4).map(c => `${c.name} (${c.mult}x)`).join(", ");
   document.getElementById("perfBreakTxt").innerHTML =
-    `A–F Gruplar (canlı başarı): ${esc(grpTxt || "Henüz yok")}<br/>Kombinasyonlar: ${esc(comboTxt || "Henüz yok")}<br/>Zaman Dilimleri: ${esc(tfTxt || "Henüz yok")}<br/>Konsept Katsayıları: ${esc(topC || "Varsayılan 1.0x")}`;
+    `Bağımsız Gruplar 1,2,3,4,5,7 (canlı başarı): ${esc(grpTxt || "Henüz yok")}<br/>Grup 6 confluence eşlik ettiği işlemler: ${esc((lr.confluence_table || []).map(g => `${g.activations} etkinleşme · ${g.wr}% WR · ${g.net_r}R (bağımsız strateji değildir)`).join(" | ") || "Henüz yok")}<br/>Kombinasyonlar: ${esc(comboTxt || "Henüz yok")}<br/>Zaman Dilimleri: ${esc(tfTxt || "Henüz yok")}<br/>Konsept Katsayıları: ${esc(topC || "Varsayılan 1.0x")}`;
 
-  const fm = (m) => !m ? "-" :
-    `${m.trades} işlem · WR ${m.win_rate}% · SL ${m.sl_rate == null ? "-" : m.sl_rate + "%"} · Net ${m.net_r}R · PF ${m.profit_factor} · Exp ${m.expectancy_r}R · DD ${m.max_drawdown_r}R`;
+  const fm = (m) => !m ? "-" : (() => {
+    const ci = m.ci95 ? ` · Exp %95 GA [${m.ci95.expectancy_r_95[0]}, ${m.ci95.expectancy_r_95[1]}]R` : "";
+    const warn = m.sample_warning ? ` · ${m.sample_warning}` : "";
+    return `${m.trades} işlem · WR ${m.win_rate}% · SL ${m.sl_rate == null ? "-" : m.sl_rate + "%"} · Net ${m.net_r}R · PF ${m.profit_factor} · Exp ${m.expectancy_r}R · DD ${m.max_drawdown_r}R${ci}${warn}`;
+  })();
   const grpRows = (g) => Object.entries(g || {}).sort().map(([k, m]) => `<div>Grup ${esc(k)}: ${fm(m)}</div>`).join("") || "-";
   const bt = d.backtest;
   if (bt && !bt.error) {
@@ -5214,10 +5451,14 @@ function renderFaz3(d) {
         `${esc(bt.pair)} (${esc(bt.tf)}) · ${bt.bars} mum · Ort. maliyet ${bt.cost_model_r}R<br/>` +
         `<b>Eski (ICT):</b> ${fm(bt.legacy.overall)}<br/>` +
         `<b>Yeni (Gruplar):</b> ${fm(bt.v3.overall)}<br/>` +
-        `<b>Out-of-Sample eski:</b> ${fm(bt.legacy.out_of_sample)}<br/>` +
-        `<b>Out-of-Sample yeni:</b> ${fm(bt.v3.out_of_sample)}<br/>` +
-        `<div style="margin-top:4px"><b>Grup bazında (yeni sistem)</b></div>${grpRows(bt.v3.groups)}` +
-        `<span class="muted">Tek parite örneği küçüktür; karar için "A/B Backtest (çoklu parite)" sonucuna bak.</span>`;
+        `<b>Eğitim %60 eski/yeni:</b> ${fm(bt.legacy.in_sample)} / ${fm(bt.v3.in_sample)}<br/>` +
+        `<b>Doğrulama %20 eski/yeni:</b> ${fm(bt.legacy.validation)} / ${fm(bt.v3.validation)}<br/>` +
+        `<b>Kilitli OOS %20 eski/yeni:</b> ${fm(bt.legacy.out_of_sample)} / ${fm(bt.v3.out_of_sample)}<br/>` +
+        `<div style="margin-top:4px"><b>Bağımsız strateji grupları (1,2,3,4,5,7)</b></div>${grpRows(bt.v3.groups)}<div style="margin-top:4px"><b>Grup 6 confluence eşlik ettiği işlemler (bağımsız motor değildir)</b></div>${grpRows(bt.v3.confluence)}` +
+        `<div style="margin-top:6px"><b>Walk-forward pencereleri (sabit parametre)</b></div>${(bt.walk_forward || []).map(w => `<div>${esc(w.window)}: ${fm(w)}</div>`).join("") || "Örneklem yetersiz"}` +
+        `<div style="margin-top:6px"><b>Parametre duyarlılığı / grup eşik denemeleri</b></div>${(bt.sensitivity?.scenarios || []).map(x => `<div>${esc(x.name)}: ${fm(x.overall)} · OOS: kilitli / kullanılmadı</div>`).join("") || "Rapor yok"}` +
+        `<div class="muted">${esc(bt.sensitivity?.warning || bt.oos_protocol || "OOS ve WF raporları ayrı değerlendirilmelidir.")}</div>` +
+        `<span class="muted">Tek parite örneği küçüktür; çoklu parite sonuçları ve dış örneklem ayrıca değerlendirilmelidir.</span>`;
     } else {
       const oos = bt.out_of_sample || {};
       const ov = bt.overall || {};
@@ -5261,14 +5502,19 @@ function renderFaz3(d) {
       const rel = Object.entries(r.v3.relax || {}).map(([k, m]) => `<div>${esc(k)}: ${fm(m)}</div>`).join("");
       const blk = Object.entries(r.blocked || {}).map(([k, m]) => `<div>${esc(k)}: ${fm(m)}</div>`).join("");
       aEl.innerHTML =
-        `${r.pairs} parite · ${esc(r.tf)}<br/>` +
+        `${r.pairs}/${r.requested_pairs ?? r.pairs} parite tamamlandı · ${esc(r.tf)} · başarısız: ${r.failed_pairs ?? 0}<br/>` +
         `<b>Eski (ICT):</b> ${fm(r.legacy.overall)}<br/>` +
         `<b>Yeni (Gruplar):</b> ${fm(r.v3.overall)}<br/>` +
-        `<b>OOS eski:</b> ${fm(r.legacy.out_of_sample)}<br/>` +
-        `<b>OOS yeni:</b> ${fm(r.v3.out_of_sample)}` +
-        `<div style="margin-top:6px"><b>Grup bazında (A–F)</b></div>${grpRows(r.v3.groups)}` +
+        `<b>Eğitim %60 eski/yeni:</b> ${fm(r.legacy.in_sample)} / ${fm(r.v3.in_sample)}<br/>` +
+        `<b>Doğrulama %20 eski/yeni:</b> ${fm(r.legacy.validation)} / ${fm(r.v3.validation)}<br/>` +
+        `<b>Kilitli OOS %20 eski/yeni:</b> ${fm(r.legacy.out_of_sample)} / ${fm(r.v3.out_of_sample)}` +
+        `<div style="margin-top:6px"><b>Bağımsız strateji grupları (1,2,3,4,5,7)</b></div>${grpRows(r.v3.groups)}<div style="margin-top:4px"><b>Grup 6 confluence eşlik ettiği işlemler (bağımsız motor değildir)</b></div>${grpRows(r.v3.confluence)}` +
         `<div style="margin-top:6px"><b>Yeni sistemde işlemler (esnetilen koşula göre)</b></div>${rel}` +
-        `<div style="margin-top:6px"><b>Engellenen kurulumların sanal sonucu (backtest)</b></div>${blk || "-"}`;
+        `<div style="margin-top:6px"><b>Rejim bazında (trend/yatay/volatil)</b></div>${grpRows(r.v3.regimes)}` +
+        `<div style="margin-top:6px"><b>ÇOKLU engel kombinasyonları</b></div>${Object.entries(r.blocked_combinations || {}).map(([k,m]) => `<div>${esc(k)}: ${fm(m)}</div>`).join("") || "-"}` +
+        `<div style="margin-top:6px"><b>Tek filtre engelleri</b></div>${Object.entries(r.blocked_single_filter_only || {}).map(([k,m]) => `<div>${esc(k)}: ${fm(m)}</div>`).join("") || "-"}` +
+        `<div style="margin-top:6px"><b>Engellenen kurulumların sanal sonucu (backtest)</b></div>${blk || "-"}` +
+        `<div class="muted">Evren: ${esc(r.coverage?.universe || "-")}${r.coverage?.universe_complete === false ? " · UYARI: API erişimi nedeniyle yedek parite listesi kullanıldı" : ""}<br/>OOS: ${esc(r.v3.split_method || "-")} · WF: ${esc(r.walk_forward_method || "-")}</div>`;
     }
   }
 }
@@ -5305,6 +5551,13 @@ function render(data) {
   const errPart = data.scan_errors ? ` · Hata:${data.scan_errors}` : "";
   const scanInfo = data.scanning ? ` · Taranıyor (${data.scan_ok}/${data.scan_total}${errPart})` : (data.last_scan ? ` · Tarama ${data.last_scan} (${data.scan_ok}/${data.scan_total}${errPart})` : "");
   setText(document.getElementById("metaTxt"), `${data.ws_status || "-"}${scanInfo}`);
+  const dh = data.data_health || {};
+  const mu = data.market_universe || {};
+  const universeLabel = mu.using_fallback
+    ? `YEDEK LİSTE (${dh.tracked_pairs ?? 0})`
+    : `AKTİF SWAP ${mu.eligible ?? dh.tracked_pairs ?? 0}`;
+  setText(document.getElementById("dataHealth"),
+    `WS: ${dh.ws_connected ? "BAĞLI" : "BAĞLI DEĞİL"} · Evren: ${universeLabel} · Bayat LAST: ${dh.stale_last_prices ?? 0}/${dh.tracked_pairs ?? 0} · WS reconnect: ${dh.ws_reconnects ?? 0}`);
 
   const sel = data.selected_item;
   const sigs = data.signals || [];
@@ -5335,7 +5588,7 @@ function render(data) {
   renderChart(sel, currentTf, sigs);
 
   setText(document.getElementById("sigCnt"), String(sigs.length));
-  const minScTxt = (data.learning || {}).min_score ?? 85;
+  const minScTxt = (data.learning || {}).min_score ?? 80;
   const minGrpTxt = data.min_groups ?? 1;
   renderSignals(sigs, minScTxt, minGrpTxt);
   if (newestSig) flashSignal(newestSig.id);
@@ -5405,9 +5658,9 @@ document.getElementById("btBtn").addEventListener("click", async () => {
 });
 
 document.getElementById("btMultiBtn").addEventListener("click", async () => {
-  document.getElementById("abTxt").textContent = "A/B backtest başlatılıyor...";
+  document.getElementById("abTxt").textContent = "Tüm aktif SWAP paritelerinde A/B backtest başlatılıyor...";
   try {
-    await fetch(`/api/backtest_multi?tf=${encodeURIComponent(currentTf)}&n=40`, { method: "POST" });
+    await fetch(`/api/backtest_multi?tf=${encodeURIComponent(currentTf)}&n=all`, { method: "POST" });
   } catch (e) {}
   poll();
 });
@@ -5431,7 +5684,7 @@ document.getElementById("resetNetBtn").addEventListener("click", async () => {
 
 initChart();
 poll();
-setInterval(poll, 700);
+setInterval(poll, 1500);
 </script>
 </body>
 </html>
@@ -5546,14 +5799,17 @@ class Handler(BaseHTTPRequestHandler):
             tf = qs.get("tf", [STATE["tf"]])[0]
             if tf not in ALL_SCAN_TFS:
                 tf = "4H"
+            raw_n = str(qs.get("n", ["all"])[0]).strip().lower()
             try:
-                n = max(3, min(40, int(qs.get("n", ["40"])[0])))
+                n = None if raw_n in ("", "all", "0", "none") else max(1, int(raw_n))
             except Exception:
-                n = 40
+                n = None
             with LOCK:
                 running = bool((STATE.get("backtest_multi") or {}).get("running"))
                 if not running:
-                    STATE["backtest_multi"] = {"running": True, "done": 0, "total": n, "tf": tf, "result": None}
+                    STATE["backtest_multi"] = {"running": True, "done": 0,
+                                                "total": len(STATE.get("crypto_pairs") or []) if n is None else n,
+                                                "tf": tf, "result": None}
             if not running:
                 threading.Thread(target=run_backtest_multi, args=(tf, n), daemon=True).start()
             self._json({"ok": True, "started": not running})
